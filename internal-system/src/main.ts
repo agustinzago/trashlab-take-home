@@ -1,6 +1,6 @@
 import pg from "pg";
 import { buildApp } from "./app.ts";
-import { migrate } from "./db.ts";
+import { migrate } from "../../shared/db.ts";
 import { startDelivery } from "./outbox.ts";
 
 function required(name: string): string {
@@ -10,7 +10,7 @@ function required(name: string): string {
 }
 
 const pool = new pg.Pool({ connectionString: required("DATABASE_URL") });
-await migrate(pool);
+await migrate(pool, new URL("./schema.sql", import.meta.url));
 
 const app = buildApp(pool);
 await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 3001) });

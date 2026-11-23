@@ -4,8 +4,8 @@ import pg from "pg";
 // Keep DATE columns as "YYYY-MM-DD" strings instead of timezone-shifted Dates.
 pg.types.setTypeParser(pg.types.builtins.DATE, (v) => v);
 
-export async function migrate(pool: pg.Pool): Promise<void> {
-  const sql = await readFile(new URL("./schema.sql", import.meta.url), "utf8");
+export async function migrate(pool: pg.Pool, schema: URL): Promise<void> {
+  const sql = await readFile(schema, "utf8");
   // Serialize concurrent migrations (several test files, or app replicas).
   const client = await pool.connect();
   try {

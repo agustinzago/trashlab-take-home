@@ -12,7 +12,8 @@ services:
       retries: 15
 
   internal-system:
-    build: { context: ., dockerfile: internal-system/Dockerfile }
+    build: .
+    command: ["node", "internal-system/src/main.ts"]
     environment:
       DATABASE_URL: postgres://internal:internal@internal-db:5432/internal
       PORT: "3001"
@@ -22,3 +23,30 @@ services:
     ports: ["3001:3001"]
     depends_on:
       internal-db: { condition: service_healthy }
+
+  sync-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sync
+      POSTGRES_PASSWORD: sync
+      POSTGRES_DB: sync
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "sync"]
+      interval: 2s
+      retries: 15
+
+  sync:
+    build: .
+    command: ["node", "sync/src/main.ts"]
+    environment:
+      DATABASE_URL: postgres://sync:sync@sync-db:5432/sync
+      PORT: "3000"
+      INTERNAL_URL: http://internal-system:3001
+      INTERNAL_WEBHOOK_SECRET: ${INTERNAL_WEBHOOK_SECRET:-dev-internal-secret}
+      QBO_BASE_URL: ${QBO_BASE_URL:-https://sandbox-quickbooks.api.intuit.com}
+      QBO_REALM_ID: ${QBO_REALM_ID:-}
+      QBO_ACCESS_TOKEN: ${QBO_ACCESS_TOKEN:-}
+      ACCOUNT_MAPPING: ${ACCOUNT_MAPPING:-{}}
+    ports: ["${SYNC_PORT:-3000}:3000"]
+    depends_on:
+      sync-db: { condition: service_healthy }

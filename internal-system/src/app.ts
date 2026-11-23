@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type pg from "pg";
-import { tx } from "./db.ts";
+import { tx } from "../../shared/db.ts";
 import { emit } from "./outbox.ts";
 
 type Line = { description: string; amountCents: number; revenueCategory: string };

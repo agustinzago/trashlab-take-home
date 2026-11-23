@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["internal-system"]
+  "include": ["internal-system", "sync", "shared"]
 }

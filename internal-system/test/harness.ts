@@ -1,28 +1,16 @@
-import pg from "pg";
+import type pg from "pg";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.ts";
-import { migrate } from "../src/db.ts";
+import { testPool } from "../../shared/test-db.ts";
 
-// A database of its own, so a running Internal System never consumes the tests' outbox.
-const server = process.env.TEST_DATABASE_SERVER ?? "postgres://internal:internal@localhost:5433";
-let created = false;
+export const internalSchema = new URL("../src/schema.sql", import.meta.url);
 
-async function ensureTestDatabase() {
-  if (created) return;
-  const admin = new pg.Client({ connectionString: `${server}/internal` });
-  await admin.connect();
-  await admin.query("CREATE DATABASE internal_test").catch((err) => {
-    if (err.code !== "42P04") throw err; // already exists
-  });
-  await admin.end();
-  created = true;
+export function internalTestPool(): Promise<pg.Pool> {
+  return testPool("internal_test", internalSchema, ["customers", "invoices", "payments", "idempotency_keys", "outbox"]);
 }
 
 export async function setup(): Promise<{ app: FastifyInstance; pool: pg.Pool }> {
-  await ensureTestDatabase();
-  const pool = new pg.Pool({ connectionString: `${server}/internal_test` });
-  await migrate(pool);
-  await pool.query("TRUNCATE customers, invoices, payments, idempotency_keys, outbox RESTART IDENTITY CASCADE");
+  const pool = await internalTestPool();
   const app = buildApp(pool);
   await app.ready();
   return { app, pool };
