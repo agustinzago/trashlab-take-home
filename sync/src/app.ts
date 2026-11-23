@@ -4,7 +4,7 @@ import type pg from "pg";
 import type { InternalClient } from "./internal.ts";
 import type { QboClient } from "./qbo.ts";
 import { registerAdmin } from "./admin.ts";
-import { recordHint } from "./worker.ts";
+import { recordHint, type RetryConfig } from "./worker.ts";
 
 export type SyncDeps = {
   pool: pg.Pool;
@@ -15,6 +15,8 @@ export type SyncDeps = {
   qboWebhookVerifier: string;
   /** When set, /admin requires HTTP Basic auth as admin:<password>. */
   adminPassword?: string;
+  /** Retry delays per error class; defaults to production values. */
+  retry?: RetryConfig;
 };
 
 function hmacMatches(expected: string, header: unknown): boolean {

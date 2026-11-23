@@ -173,7 +173,7 @@ describe("An internal Invoice appears in QBO", () => {
     expect(attempt.snapshots.internal).toMatchObject({ docNumber: "INV-108", version: 1 });
   });
 
-  it("records a failed attempt with the writes that landed, then retries later", async () => {
+  it("records a failed attempt with the writes that landed before the failure", async () => {
     await h.mapRevenue("hosting", "999"); // an Item QBO does not have
     await issueInvoice("INV-110", "Umbrella");
 
@@ -188,8 +188,9 @@ describe("An internal Invoice appears in QBO", () => {
         writes: [{ side: "qbo", action: "create", entity: "Customer", id: h.qbo.customers[0].Id }],
       },
     ]);
-    const { rows } = await h.pool.query("SELECT status, attempts, next_run_at > now() AS later FROM sync_jobs");
-    expect(rows).toEqual([{ status: "pending", attempts: 1, later: true }]);
+    // QBO rejected the reference: a permanent error, so the job fails at once rather than retrying.
+    const { rows } = await h.pool.query("SELECT status, attempts FROM sync_jobs");
+    expect(rows).toEqual([{ status: "failed", attempts: 1 }]);
   });
 
   it("marks an Invoice whose revenue category has no Account Mapping as Needs Attention", async () => {

@@ -78,6 +78,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS conflicts_one_open ON conflicts (link_id) WHER
 
 -- Idempotent changes to tables created by earlier versions of this file.
 ALTER TABLE links ALTER COLUMN internal_id DROP NOT NULL;
+-- The QBO requestid of a create in flight, kept on the pending Link so every retry reuses it.
+ALTER TABLE links ADD COLUMN IF NOT EXISTS pending_request_id text;
+-- Fences a claimed job: set at each claim, checked when the run settles it.
+ALTER TABLE sync_jobs ADD COLUMN IF NOT EXISTS lease_token uuid;
 DO $$ BEGIN
   -- Rebuild the outcome CHECK only when it predates the current list (avoids a table scan on every start).
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_attempts_outcome_check'

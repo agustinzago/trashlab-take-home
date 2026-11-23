@@ -18,7 +18,7 @@ export function createInternalClient(baseUrl: string) {
   async function get<T>(path: string): Promise<T | null> {
     const res = await fetch(baseUrl + path, { signal: AbortSignal.timeout(10_000) });
     if (res.status === 404) return null;
-    if (!res.ok) throw new Error(`Internal System GET ${path} -> ${res.status} ${await res.text()}`);
+    if (!res.ok) throw Object.assign(new Error(`Internal System GET ${path} -> ${res.status} ${await res.text()}`), { status: res.status });
     return res.json() as Promise<T>;
   }
   async function send<T>(method: string, path: string, body: object, headers: Record<string, string>): Promise<T> {

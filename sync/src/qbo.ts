@@ -16,6 +16,8 @@ export class QboError extends Error {
 
 const MINOR_VERSION = "75";
 
+const withRequestId = (path: string, requestId?: string) => (requestId ? `${path}?requestid=${encodeURIComponent(requestId)}` : path);
+
 /** Thin client over the QBO Accounting API: query, create and read entities. */
 export function createQboClient(cfg: QboConfig) {
   async function call(method: string, path: string, body?: object): Promise<any> {
@@ -47,12 +49,13 @@ export function createQboClient(cfg: QboConfig) {
       const json = await call("GET", `query?query=${encodeURIComponent(`select * from ${entity}${filter}`)}`);
       return json.QueryResponse?.[entity] ?? [];
     },
-    async create(entity: string, body: object): Promise<any> {
-      return (await call("POST", entity.toLowerCase(), body))[entity];
+    /** `requestId` lets QBO recognise a retry of the same write (its replay window is short, so callers also look before re-creating). */
+    async create(entity: string, body: object, requestId?: string): Promise<any> {
+      return (await call("POST", withRequestId(entity.toLowerCase(), requestId), body))[entity];
     },
     /** QBO updates POST to the create endpoint with Id and SyncToken in the body. */
-    async update(entity: string, body: { Id: string; SyncToken: string; [field: string]: unknown }): Promise<any> {
-      return (await call("POST", entity.toLowerCase(), body))[entity];
+    async update(entity: string, body: { Id: string; SyncToken: string; [field: string]: unknown }, requestId?: string): Promise<any> {
+      return (await call("POST", withRequestId(entity.toLowerCase(), requestId), body))[entity];
     },
     async get(entity: string, id: string): Promise<any> {
       return (await call("GET", `${entity.toLowerCase()}/${id}`))[entity];

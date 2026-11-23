@@ -52,10 +52,10 @@ LWW for Cosmetic Fields uses each system's own updatedAt, which is only as good 
 Every write is guarded three ways:
 
 1. **Optimistic concurrency.** QBO writes carry the SyncToken we read; a 5010 error means someone edited in between, so we refetch and re-merge. Internal writes carry `If-Match: version`, and a 409 is handled the same way. We never write blind over a concurrent edit.
-2. **Server-side idempotency keys.** QBO's `requestid` is derived from (record, SyncToken, body) for updates and stored on the pending Link for creates. Internal creates use an `Idempotency-Key` header.
-3. **Look before re-creating.** A create first writes a `pending` Link (with its request id) and only then calls the other side. If the call times out, we can't know whether it landed. QBO's requestid window is short and not guaranteed, so the retry searches the target by DocNumber (payments are found through the invoice's `LinkedTxn`), adopts the record if it's there, and creates it only if it isn't.
+2. **Server-side idempotency keys.** QBO's `requestid` is derived from (record, SyncToken, body) for updates and stored on the pending Link for creates. Internal creates use an `Idempotency-Key` header. A QBO customer create derives its requestid from the display name, and the lookup by name before creating covers a lost reply. A create keeps its requestid only while the outcome is unknown (a lost reply); when QBO answers with an error it did not take the write, so the pending Link gets a fresh requestid and a replayed failure can't block the retry.
+3. **Look before re-creating.** A create first writes a `pending` Link (with its request id) and only then calls the other side. If the call times out, we can't know whether it landed. QBO's requestid window is short and not guaranteed, so the retry searches the target by DocNumber (payments are found through the invoice's `LinkedTxn`), adopts the record if it's there and its DocNumber, customer, date and lines match what was sent, flags it Needs Attention if they don't (someone else's record with that DocNumber), and creates it only if nothing is there.
 
-The Base advances only after every write in a run succeeds. If QBO accepted its half and the internal write then failed, the retry refetches and finds QBO already holding the merged value. Both sides changed that field to the same value, so it converges, and only the missing internal half is written. This exact sequence needs its own test.
+The full Base advances only after every write in a run succeeds. One refinement: once the QBO half of a run lands, the fields just written are recorded in the Base, because both Sides now hold them. If the internal write then fails, the retry refetches and sees only what is still missing, so only the internal half is written. Without that step, an internal edit made between our two writes would make our own QBO write look like a QBO edit and raise a false Conflict (or lose a Cosmetic Field to last-writer-wins). Both sequences have their own tests.
 
 Errors are classified as `transient` (timeout, 5xx, 429), `stale`, `auth`, `not_found` or `permanent`.
 
@@ -63,6 +63,9 @@ Errors are classified as `transient` (timeout, 5xx, 429), `stale`, `auth`, `not_
 - `stale` retries in 500 ms.
 - `auth` retries every 5 minutes, so a lapsed connection holds work until someone reconnects.
 - `permanent` fails the job and shows it on the admin page.
+- `not_found` also fails the job: the record vanished mid-run, and the next hint for it starts afresh.
+- `stale` is capped at the same 10 attempts as `transient`, so a record edited non-stop still surfaces.
+- An error with no HTTP reply counts as `transient` only for a timeout, a dropped connection or a lost database connection. Anything else (a bug, unexpected data) is `permanent`.
 
 Each run writes exactly one **Sync Attempt** row. It records the outcome, a summary, the merge plan, the snapshots of the Base and both sides, every write performed (including writes that landed before a failure) and any notes, such as edits discarded by a void.
 

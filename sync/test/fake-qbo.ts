@@ -9,6 +9,14 @@ import type { AddressInfo } from "node:net";
  */
 export type QboEvent = { name: string; id: string; operation: "Create" | "Update"; lastUpdated: string };
 
+/**
+ * Faults to inject into matching requests. A "timeout" drops the connection, so the
+ * client cannot tell whether the write happened: before commit nothing was applied,
+ * after commit it was.
+ */
+export type FaultKind = "timeoutBeforeCommit" | "timeoutAfterCommit" | 500 | 429;
+type InjectedFault = { kind: FaultKind; times: number; method: string; path: RegExp };
+
 export type FakeQbo = {
   url: string;
   realmId: string;
@@ -24,6 +32,14 @@ export type FakeQbo = {
   accountantCreate(fields: object): any;
   /** An accountant edits an Invoice in the QBO UI (sparse fields, Line replaces all lines). */
   accountantEdit(id: string, fields: object): any;
+  /** Fails the next `times` requests matching method and path (default: any POST). */
+  injectFault(kind: FaultKind, opts?: { times?: number; method?: string; path?: RegExp }): void;
+  /** Runs `fn` just before the next write is applied, e.g. a concurrent accountant edit. */
+  beforeNextWrite(fn: () => void): void;
+  /** Whether a repeated `requestid` replays the first response (QBO's window is short and not guaranteed). */
+  requestIdDedupe: boolean;
+  /** While true every request is rejected as unauthorized, like an expired connection. */
+  authExpired: boolean;
   close(): Promise<void>;
 };
 
@@ -104,14 +120,51 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     return updated;
   }
 
-  const app = Fastify();
+  const faults: InjectedFault[] = [];
+  const beforeWrite: (() => void)[] = [];
+  const replies = new Map<string, { statusCode: number; payload: string }>();
+  const control = { requestIdDedupe: true, authExpired: false };
+
+  const app = Fastify({ logger: false });
   app.addHook("onRequest", async (req, reply) => {
-    if (!req.headers.authorization?.startsWith("Bearer ")) {
-      return reply.code(401).send({ fault: { error: [{ message: "AuthenticationFailed", code: "3200" }] } });
+    if (control.authExpired || !req.headers.authorization?.startsWith("Bearer ")) {
+      return reply.code(401).send({ fault: { error: [{ message: "AuthenticationFailed", detail: "Token expired", code: "3200" }] } });
     }
+    const path = req.url.split("?")[0];
+    const fault = faults.find((f) => f.method === req.method && f.path.test(path));
+    if (!fault) return;
+    if (--fault.times <= 0) faults.splice(faults.indexOf(fault), 1);
+    if (fault.kind === "timeoutBeforeCommit") {
+      req.raw.socket.destroy();
+      return reply.hijack();
+    }
+    if (fault.kind === "timeoutAfterCommit") {
+      (req as any).dropAfterCommit = true;
+      return;
+    }
+    const message = fault.kind === 429 ? "ThrottleExceeded" : "An application error has occurred";
+    return reply.code(fault.kind).send({ Fault: { Error: [{ Message: message, code: fault.kind === 429 ? "003001" : "10000" }] } });
   });
-  app.addHook("preHandler", async (req) => {
-    if (req.method !== "GET") writes.push({ method: req.method, path: req.url.split("?")[0], body: req.body });
+  app.addHook("preHandler", async (req, reply) => {
+    if (req.method === "GET") return;
+    writes.push({ method: req.method, path: req.url.split("?")[0], body: req.body });
+    const requestId = (req.query as { requestid?: string }).requestid;
+    const seen = requestId && replies.get(requestId);
+    if (seen && control.requestIdDedupe) {
+      (req as any).replayed = true;
+      return reply.code(seen.statusCode).type("application/json").send(seen.payload);
+    }
+    beforeWrite.splice(0).forEach((fn) => fn());
+  });
+  app.addHook("onSend", async (req, reply, payload) => {
+    const requestId = (req.query as { requestid?: string }).requestid;
+    // ponytail: replays successful writes only; confirm in the sandbox spike whether QBO also replays errors.
+    if (requestId && !(req as any).replayed && reply.statusCode < 300) {
+      replies.set(requestId, { statusCode: reply.statusCode, payload: payload as string });
+    }
+    // The write is committed; now lose the response.
+    if ((req as any).dropAfterCommit) req.raw.socket.destroy();
+    return payload;
   });
   app.setErrorHandler((err: Error, _req, reply) => {
     const code = err instanceof Fault ? err.code : "500";
@@ -172,6 +225,21 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     writes,
     addItem: (name) => add("Item", { Name: name, Type: "Service" }),
     addCustomer: (displayName) => add("Customer", { DisplayName: displayName }),
+    injectFault: (kind, opts = {}) =>
+      faults.push({ kind, times: opts.times ?? 1, method: opts.method ?? "POST", path: opts.path ?? /./ }),
+    beforeNextWrite: (fn) => beforeWrite.push(fn),
+    get requestIdDedupe() {
+      return control.requestIdDedupe;
+    },
+    set requestIdDedupe(v) {
+      control.requestIdDedupe = v;
+    },
+    get authExpired() {
+      return control.authExpired;
+    },
+    set authExpired(v) {
+      control.authExpired = v;
+    },
     accountantCreate: (fields) => createInvoice(fields),
     accountantEdit: (id, fields) => updateInvoice(id, fields, false),
     close: () => app.close(),

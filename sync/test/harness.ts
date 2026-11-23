@@ -26,6 +26,12 @@ const urlOf = (app: FastifyInstance) => `http://127.0.0.1:${(app.server.address(
 export async function setupSync() {
   const internalPool = await internalTestPool();
   const internalApp = buildInternalApp(internalPool);
+  // Lets a test act (e.g. a user edit) just before the sync's next matching request reaches the Internal System.
+  const internalHooks: { method: string; path: RegExp; fn: () => Promise<unknown> }[] = [];
+  internalApp.addHook("onRequest", async (req) => {
+    const i = internalHooks.findIndex((x) => x.method === req.method && x.path.test(req.url));
+    if (i >= 0) await internalHooks.splice(i, 1)[0].fn();
+  });
   await internalApp.listen({ host: "127.0.0.1", port: 0 });
 
   const qbo: FakeQbo = await startFakeQbo();
@@ -43,6 +49,8 @@ export async function setupSync() {
     qbo: createQboClient({ baseUrl: qbo.url, realmId: qbo.realmId, getAccessToken: async () => "test-token" }),
     internalWebhookSecret: webhookSecret,
     qboWebhookVerifier,
+    // Retry at once in tests, except a lapsed connection, which waits until the test advances the clock.
+    retry: { transientBaseMs: 0, staleMs: 0, authMs: 5 * 60_000 },
   };
   const syncApp = buildSyncApp(deps);
   await syncApp.listen({ host: "127.0.0.1", port: 0 });
@@ -87,6 +95,10 @@ export async function setupSync() {
     /** Sends every queued fake-QBO change event to the sync service once. */
     deliverQbo,
     drain: () => drain(deps),
+    beforeNextInternalRequest: (method: string, path: RegExp, fn: () => Promise<unknown>) =>
+      internalHooks.push({ method, path, fn }),
+    /** Makes every waiting retry due now, as if its delay had passed. */
+    advanceClock: () => pool.query("UPDATE sync_jobs SET next_run_at = now() WHERE status = 'pending'"),
     /** Delivers notifications from both Sides and drains, until the echoes of our own writes die out. */
     async settle() {
       for (let i = 0; i < 10; i++) {

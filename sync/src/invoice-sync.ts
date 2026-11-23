@@ -1,14 +1,25 @@
+import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type pg from "pg";
 import { tx } from "../../shared/db.ts";
 import type { SyncDeps } from "./app.ts";
 import type { InternalInvoice } from "./internal.ts";
 import { merge, type InvoiceFields, type Line } from "./merge.ts";
 import type { Run } from "./worker.ts";
+import { QboError } from "./qbo.ts";
 
 /** A problem only a person can fix (missing mapping, identity clash); recorded as Needs Attention. */
 class NeedsAttention extends Error {}
 
-type Link = { id: number; internal_id: string | null; qbo_id: string | null; doc_number: string; state: string; base: InvoiceFields };
+type Link = {
+  id: number;
+  internal_id: string | null;
+  qbo_id: string | null;
+  doc_number: string;
+  state: string;
+  base: InvoiceFields;
+  pending_request_id: string | null;
+};
 
 /** Holds a session advisory lock on the DocNumber for the duration of `fn`, serializing work on one Invoice. */
 async function withInvoiceLock<T>(pool: pg.Pool, docNumber: string, fn: () => Promise<T>): Promise<T> {
@@ -30,6 +41,24 @@ async function findLink(pool: pg.Pool, side: string, id: string): Promise<Link |
   const { rows } = await pool.query(`SELECT * FROM links WHERE record_type = 'invoice' AND ${column} = $1`, [id]);
   return rows[0];
 }
+
+/** A Link still missing one Side's id: a create in flight (or stuck) for this DocNumber. */
+async function findPendingLink(pool: pg.Pool, docNumber: string): Promise<Link | undefined> {
+  const { rows } = await pool.query(
+    "SELECT * FROM links WHERE record_type = 'invoice' AND (internal_id IS NULL OR qbo_id IS NULL) AND doc_number = $1",
+    [docNumber],
+  );
+  return rows[0];
+}
+
+const isIncomplete = (link: Link) => link.internal_id === null || link.qbo_id === null;
+
+/** Whether a record found on the target is the one our earlier create sent: identity and Financial Fields match. */
+const isOurs = (found: InvoiceFields, sent: InvoiceFields) =>
+  (["docNumber", "customer", "txnDate", "lines"] as const).every((f) => isDeepStrictEqual(found[f], sent[f]));
+
+/** A QBO requestid derived from what is being written, so a retry of the same write reuses it. */
+const requestIdFor = (...parts: unknown[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 36);
 
 // --- Account Mapping: revenue category <-> QBO Item ---------------------------------
 
@@ -114,7 +143,7 @@ const isQboVoided = (q: any) => q.TotalAmt === 0 && String(q.PrivateNote ?? "").
 async function qboCustomerId(deps: SyncDeps, run: Run, name: string): Promise<string> {
   const found = (await deps.qbo.query("Customer", ["DisplayName", name]))[0];
   if (found) return found.Id;
-  const created = await deps.qbo.create("Customer", { DisplayName: name });
+  const created = await deps.qbo.create("Customer", { DisplayName: name }, requestIdFor("customer", name));
   run.writes.push({ side: "qbo", action: "create", entity: "Customer", id: created.Id });
   return created.Id;
 }
@@ -152,7 +181,60 @@ async function toInternalFields(deps: SyncDeps, run: Run, f: Partial<InvoiceFiel
   return customer === undefined ? rest : { ...rest, customerId: await internalCustomerId(deps, run, customer) };
 }
 
-// --- The three kinds of run --------------------------------------------------------
+// --- Creating on the other Side: the pending-Link protocol --------------------------
+//
+// A create first commits a pending Link (holding the QBO requestid), then calls the
+// other Side, then marks the Link linked. A timeout says nothing about whether the
+// write landed, so a retry (or the echo of the write) finds the pending Link by
+// DocNumber and looks on the target first, adopting the record if it is there.
+
+async function insertPendingLink(pool: pg.Pool, internalId: string | null, qboId: string | null, fields: InvoiceFields): Promise<Link> {
+  const { rows } = await pool.query(
+    `INSERT INTO links (record_type, internal_id, qbo_id, doc_number, state, base, pending_request_id)
+     VALUES ('invoice', $1, $2, $3, 'pending', $4, $5) RETURNING *`,
+    [internalId, qboId, fields.docNumber, JSON.stringify(fields), qboId === null ? randomUUID() : null],
+  );
+  return rows[0];
+}
+
+async function completeLink(pool: pg.Pool, run: Run, link: Link, ids: { internalId?: string; qboId?: string }, base: InvoiceFields, summary: string) {
+  await tx(pool, async (c) => {
+    await c.query(
+      `UPDATE links SET internal_id = COALESCE($2, internal_id), qbo_id = COALESCE($3, qbo_id), state = 'linked',
+         base = $4, pending_request_id = NULL, updated_at = now() WHERE id = $1`,
+      [link.id, ids.internalId ?? null, ids.qboId ?? null, JSON.stringify(base)],
+    );
+    await run.record(c, "synced", `${summary} (DocNumber ${base.docNumber})`, link.id);
+  });
+}
+
+async function pushToQbo(deps: SyncDeps, run: Run, link: Link, fields: InvoiceFields): Promise<void> {
+  const created = await deps.qbo
+    .create("Invoice", await toQboFields(deps, run, fields), link.pending_request_id!)
+    .catch(async (err) => {
+      // A 4xx (including 429) means QBO refused this write, so a fresh requestid keeps a
+      // replay of that refusal from blocking the retry. A lost reply or a 5xx may have
+      // committed, so those keep the same one.
+      if (err instanceof QboError && err.status < 500) {
+        await deps.pool.query("UPDATE links SET pending_request_id = $2 WHERE id = $1", [link.id, randomUUID()]);
+      }
+      throw err;
+    });
+  run.writes.push({ side: "qbo", action: "create", entity: "Invoice", id: created.Id });
+  run.snapshots.qbo = created;
+  await completeLink(deps.pool, run, link, { qboId: created.Id }, fields, `Created QBO Invoice ${created.Id}`);
+}
+
+async function pushToInternal(deps: SyncDeps, run: Run, link: Link, fields: InvoiceFields): Promise<void> {
+  const { customer, ...rest } = fields;
+  const created = await deps.internal.createInvoice(
+    { ...rest, customerId: await internalCustomerId(deps, run, customer), status: "issued" },
+    `qbo-invoice:${link.qbo_id}`, // the Internal System's own idempotency covers a lost reply
+  );
+  run.writes.push({ side: "internal", action: "create", entity: "Invoice", id: String(created.id) });
+  run.snapshots.internal = created;
+  await completeLink(deps.pool, run, link, { internalId: String(created.id) }, fields, `Created internal Invoice ${created.id}`);
+}
 
 /** An internal Invoice with no Link: create it in QBO. */
 async function createInQbo(deps: SyncDeps, run: Run, inv: InternalInvoice): Promise<void> {
@@ -163,13 +245,11 @@ async function createInQbo(deps: SyncDeps, run: Run, inv: InternalInvoice): Prom
     run.snapshots.qbo = existing[0];
     throw new NeedsAttention(`QBO already has an unlinked Invoice with DocNumber ${inv.docNumber}`);
   }
-  const customer = await deps.internal.getCustomer(inv.customerId);
-  if (!customer) throw new Error(`internal customer ${inv.customerId} not found`);
-  const fields = normalizeInternal(inv, customer.displayName);
-  const created = await deps.qbo.create("Invoice", await toQboFields(deps, run, fields));
-  run.writes.push({ side: "qbo", action: "create", entity: "Invoice", id: created.Id });
-  run.snapshots.qbo = created;
-  await saveNewLink(deps.pool, run, String(inv.id), created.Id, fields, `Created QBO Invoice ${created.Id}`);
+  const fields = normalizeInternal(inv, await internalCustomerName(deps, inv));
+  await itemsFor(deps.pool, fields.lines); // a missing Account Mapping is flagged before anything is written
+  const link = await insertPendingLink(deps.pool, String(inv.id), null, fields);
+  run.linkId = link.id;
+  await pushToQbo(deps, run, link, fields);
 }
 
 /** A QBO Invoice with no Link: create it internally, already issued. */
@@ -181,30 +261,57 @@ async function createInternally(deps: SyncDeps, run: Run, q: any): Promise<void>
     run.snapshots.internal = existing[0];
     throw new NeedsAttention(`The Internal System already has an unlinked Invoice with DocNumber ${q.DocNumber}`);
   }
-  const { customer, ...rest } = fields;
-  const created = await deps.internal.createInvoice(
-    { ...rest, customerId: await internalCustomerId(deps, run, customer), status: "issued" },
-    `qbo-invoice:${q.Id}`,
-  );
-  run.writes.push({ side: "internal", action: "create", entity: "Invoice", id: String(created.id) });
-  run.snapshots.internal = created;
-  await saveNewLink(deps.pool, run, String(created.id), q.Id, fields, `Created internal Invoice ${created.id}`);
+  const link = await insertPendingLink(deps.pool, null, q.Id, fields);
+  run.linkId = link.id;
+  await pushToInternal(deps, run, link, fields);
 }
 
-async function saveNewLink(pool: pg.Pool, run: Run, internalId: string, qboId: string, base: InvoiceFields, summary: string) {
-  await tx(pool, async (c) => {
-    const { rows } = await c.query(
-      `INSERT INTO links (record_type, internal_id, qbo_id, doc_number, state, base)
-       VALUES ('invoice', $1, $2, $3, 'linked', $4) RETURNING id`,
-      [internalId, qboId, base.docNumber, JSON.stringify(base)],
-    );
-    await run.record(c, "synced", `${summary} (DocNumber ${base.docNumber})`, rows[0].id);
-  });
+/**
+ * A Link still missing one Side: an earlier create may or may not have landed.
+ * Look on the target; adopt what is found only if it is what we sent, else flag it.
+ */
+async function resumeCreate(deps: SyncDeps, run: Run, link: Link): Promise<void> {
+  run.linkId = link.id;
+  const toQbo = link.qbo_id === null;
+  const found = toQbo
+    ? (await deps.qbo.query("Invoice", ["DocNumber", link.doc_number]))[0]
+    : (await deps.internal.findInvoices(link.doc_number))[0];
+  if (found) {
+    run.snapshots[toQbo ? "qbo" : "internal"] = found;
+    const fields = toQbo ? await normalizeQbo(deps.pool, found) : normalizeInternal(found, await internalCustomerName(deps, found));
+    if (!isOurs(fields, link.base)) {
+      await deps.pool.query("UPDATE links SET state = 'attention', updated_at = now() WHERE id = $1", [link.id]);
+      throw new NeedsAttention(
+        `${toQbo ? "QBO" : "The Internal System"} has a different Invoice ${link.doc_number} than the one this sync sent; not adopting it`,
+      );
+    }
+    const id = toQbo ? { qboId: found.Id } : { internalId: String(found.id) };
+    return completeLink(deps.pool, run, link, id, link.base, `Adopted ${toQbo ? "QBO" : "internal"} Invoice ${toQbo ? found.Id : found.id} from an earlier attempt`);
+  }
+  const source = toQbo ? await deps.internal.getInvoice(link.internal_id!) : await getQboInvoice(deps, link.qbo_id!);
+  if (!source) {
+    // Nothing was created and the source is gone: drop the Link so it cannot capture a later record.
+    await deps.pool.query("DELETE FROM links WHERE id = $1", [link.id]);
+    return run.record(deps.pool, "skipped", `The source Invoice ${link.doc_number} disappeared before it was created on the other Side`);
+  }
+  run.snapshots[toQbo ? "internal" : "qbo"] = source;
+  return toQbo
+    ? pushToQbo(deps, run, link, normalizeInternal(source, await internalCustomerName(deps, source)))
+    : pushToInternal(deps, run, link, await normalizeQbo(deps.pool, source));
 }
 
-/** A linked pair: refetch both Sides, merge against the Base, write the plan, advance the Base. */
+async function internalCustomerName(deps: SyncDeps, inv: InternalInvoice): Promise<string> {
+  const customer = await deps.internal.getCustomer(inv.customerId);
+  if (!customer) throw new NeedsAttention(`Internal Invoice ${inv.docNumber} refers to missing customer ${inv.customerId}`);
+  return customer.displayName;
+}
+
+// --- A linked pair ------------------------------------------------------------------
+
+/** Refetch both Sides, merge against the Base, write the plan, advance the Base. */
 async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
   const { pool, internal, qbo } = deps;
+  run.linkId = link.id;
   if (link.state === "paused") {
     // The hint is kept (change_hints); nothing is written until a person resolves the Conflict.
     return run.record(pool, "paused", "Paused by an open Conflict; nothing written", link.id);
@@ -217,11 +324,9 @@ async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
     return run.record(pool, "skipped", "A Side is voided or deleted; voids are not synced yet", link.id);
   }
 
-  const customer = await internal.getCustomer(inv.customerId);
-  if (!customer) throw new Error(`internal customer ${inv.customerId} not found`);
   const result = merge({
     base: link.base,
-    internal: normalizeInternal(inv, customer.displayName),
+    internal: normalizeInternal(inv, await internalCustomerName(deps, inv)),
     qbo: await normalizeQbo(pool, q),
     internalUpdatedAt: inv.updatedAt,
     qboUpdatedAt: q.MetaData.LastUpdatedTime,
@@ -252,17 +357,23 @@ async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
 
   const { toQbo, toInternal, merged, notes } = result;
   if (Object.keys(toQbo).length) {
-    const updated = await qbo.update("Invoice", { Id: q.Id, SyncToken: q.SyncToken, sparse: true, ...(await toQboFields(deps, run, toQbo)) });
+    // The SyncToken we read makes QBO refuse (5010) if someone edited since; the job then refetches and re-merges.
+    const body = { Id: q.Id, SyncToken: q.SyncToken, sparse: true, ...(await toQboFields(deps, run, toQbo)) };
+    const updated = await qbo.update("Invoice", body, requestIdFor("invoice", body));
     run.writes.push({ side: "qbo", action: "update", entity: "Invoice", id: q.Id, fields: Object.keys(toQbo) });
     run.snapshots.qboAfter = updated;
+    // Both Sides now hold these fields: record that agreement, so if the internal half
+    // fails our own QBO write is not mistaken for a QBO edit on the retry.
+    const agreed = Object.fromEntries(Object.keys(toQbo).map((f) => [f, merged[f as keyof InvoiceFields]]));
+    await pool.query("UPDATE links SET base = base || $2::jsonb, updated_at = now() WHERE id = $1", [link.id, JSON.stringify(agreed)]);
   }
   if (Object.keys(toInternal).length) {
+    // If-Match: a concurrent internal edit makes this a 409, and the job refetches and re-merges.
     const updated = await internal.updateInvoice(inv.id, inv.version, await toInternalFields(deps, run, toInternal));
     run.writes.push({ side: "internal", action: "update", entity: "Invoice", id: String(inv.id), fields: Object.keys(toInternal) });
     run.snapshots.internalAfter = updated;
   }
 
-  // The Base advances only once every write in this run has landed.
   const changed = [...Object.keys(toQbo).map((f) => `${f} -> QBO`), ...Object.keys(toInternal).map((f) => `${f} -> internal`)];
   const summary = changed.length ? `Copied ${changed.join(", ")}` : "No changes";
   await tx(pool, async (c) => {
@@ -279,26 +390,26 @@ export async function syncInvoice(deps: SyncDeps, run: Run): Promise<void> {
   const { pool } = deps;
   const { side, record_id: id } = run.job;
   try {
-    const known = await findLink(pool, side, id);
-    let docNumber = known?.doc_number;
-    let record: any;
+    let docNumber = (await findLink(pool, side, id))?.doc_number;
     if (!docNumber) {
-      record = side === "internal" ? await deps.internal.getInvoice(id) : await getQboInvoice(deps, id);
+      const record = side === "internal" ? await deps.internal.getInvoice(id) : await getQboInvoice(deps, id);
       if (!record) return run.record(pool, "skipped", `Invoice ${id} no longer exists on the ${side} Side`);
       docNumber = side === "internal" ? record.docNumber : record.DocNumber;
       if (!docNumber) throw new NeedsAttention("The QBO Invoice has no DocNumber; turn on Custom transaction numbers");
     }
     await withInvoiceLock(pool, docNumber!, async () => {
-      // Re-read under the lock: the other Side's job may have just linked this record.
-      const link = await findLink(pool, side, id);
+      // Re-read under the lock: the other Side's job may have just linked this record,
+      // or this record may be the result of a create still pending on its Link.
+      const link = (await findLink(pool, side, id)) ?? (await findPendingLink(pool, docNumber!));
+      if (link && isIncomplete(link)) return resumeCreate(deps, run, link);
       if (link) return syncPair(deps, run, link);
-      record = side === "internal" ? await deps.internal.getInvoice(id) : await getQboInvoice(deps, id);
+      const record = side === "internal" ? await deps.internal.getInvoice(id) : await getQboInvoice(deps, id);
       if (!record) return run.record(pool, "skipped", `Invoice ${id} no longer exists on the ${side} Side`);
       run.snapshots[side] = record;
       return side === "internal" ? createInQbo(deps, run, record) : createInternally(deps, run, record);
     });
   } catch (err) {
     if (!(err instanceof NeedsAttention)) throw err;
-    await run.record(pool, "attention", err.message);
+    await run.record(pool, "attention", err.message, run.linkId);
   }
 }
