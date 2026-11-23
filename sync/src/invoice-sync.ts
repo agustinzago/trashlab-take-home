@@ -8,7 +8,7 @@ import type { Run } from "./worker.ts";
 /** A problem only a person can fix (missing mapping, identity clash); recorded as Needs Attention. */
 class NeedsAttention extends Error {}
 
-type Link = { id: number; internal_id: string | null; qbo_id: string | null; doc_number: string; base: InvoiceFields };
+type Link = { id: number; internal_id: string | null; qbo_id: string | null; doc_number: string; state: string; base: InvoiceFields };
 
 /** Holds a session advisory lock on the DocNumber for the duration of `fn`, serializing work on one Invoice. */
 async function withInvoiceLock<T>(pool: pg.Pool, docNumber: string, fn: () => Promise<T>): Promise<T> {
@@ -205,6 +205,10 @@ async function saveNewLink(pool: pg.Pool, run: Run, internalId: string, qboId: s
 /** A linked pair: refetch both Sides, merge against the Base, write the plan, advance the Base. */
 async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
   const { pool, internal, qbo } = deps;
+  if (link.state === "paused") {
+    // The hint is kept (change_hints); nothing is written until a person resolves the Conflict.
+    return run.record(pool, "paused", "Paused by an open Conflict; nothing written", link.id);
+  }
   const inv = await internal.getInvoice(link.internal_id!);
   const q = await getQboInvoice(deps, link.qbo_id!);
   run.snapshots = { base: link.base, internal: inv, qbo: q };
@@ -232,9 +236,18 @@ async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
     return;
   }
   if (result.kind === "conflict") {
-    // ponytail: reported only; pausing the Invoice and resolving the Conflict belong to #6.
+    // A Conflict pauses the whole Invoice, clean fields included, until a person picks a Side.
     const fields = result.conflicts.map((c) => c.field).join(", ");
-    return run.record(pool, "attention", `Conflict: ${fields} changed differently on both Sides`, link.id);
+    await tx(pool, async (c) => {
+      await c.query(
+        `INSERT INTO conflicts (link_id, fields) VALUES ($1, $2)
+         ON CONFLICT (link_id) WHERE status = 'open' DO UPDATE SET fields = EXCLUDED.fields, raised_at = now()`,
+        [link.id, JSON.stringify(result.conflicts)],
+      );
+      await c.query("UPDATE links SET state = 'paused', updated_at = now() WHERE id = $1", [link.id]);
+      await run.record(c, "conflict", `Conflict: ${fields} changed differently on both Sides; Invoice paused`, link.id);
+    });
+    return;
   }
 
   const { toQbo, toInternal, merged, notes } = result;

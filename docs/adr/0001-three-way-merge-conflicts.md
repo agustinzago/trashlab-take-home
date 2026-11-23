@@ -9,4 +9,4 @@ Both Sides can edit the same Invoice between syncs, and the two systems' clocks 
 
 ## Consequences
 
-A Base snapshot must be stored per Link and advanced only after a write to the other Side is confirmed. A paused Invoice still accepts Change Hints, but nothing is written until its Conflict is resolved.
+A Base snapshot must be stored per Link and advanced only after a write to the other Side is confirmed. A paused Invoice still accepts Change Hints, but nothing is written until its Conflict is resolved. Resolving a Conflict is the one exception to advancing the Base only after a confirmed write: each conflicting field's Base is set to the losing Side's value as it was when the Conflict was raised, so the next merge sees only the winner as changed and propagates it through the ordinary path, while a loser edited since then conflicts again.

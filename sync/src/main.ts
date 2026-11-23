@@ -32,6 +32,8 @@ const deps = {
   }),
   internalWebhookSecret: required("INTERNAL_WEBHOOK_SECRET"),
   qboWebhookVerifier: required("QBO_WEBHOOK_VERIFIER"),
+  // Fails closed: the admin page can resolve Conflicts, so it never runs open.
+  adminPassword: required("ADMIN_PASSWORD"),
 };
 
 const app = buildSyncApp(deps);

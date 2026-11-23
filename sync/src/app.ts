@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type pg from "pg";
 import type { InternalClient } from "./internal.ts";
 import type { QboClient } from "./qbo.ts";
+import { registerAdmin } from "./admin.ts";
 import { recordHint } from "./worker.ts";
 
 export type SyncDeps = {
@@ -12,6 +13,8 @@ export type SyncDeps = {
   internalWebhookSecret: string;
   /** QBO's webhook verifier token, the HMAC key for the intuit-signature header. */
   qboWebhookVerifier: string;
+  /** When set, /admin requires HTTP Basic auth as admin:<password>. */
+  adminPassword?: string;
 };
 
 function hmacMatches(expected: string, header: unknown): boolean {
@@ -90,5 +93,6 @@ export function buildSyncApp(deps: SyncDeps): FastifyInstance {
     },
   );
 
+  registerAdmin(app, deps.pool, deps.adminPassword);
   return app;
 }

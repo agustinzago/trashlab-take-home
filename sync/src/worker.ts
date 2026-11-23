@@ -6,7 +6,7 @@ import { syncInvoice } from "./invoice-sync.ts";
 type Hint = { side: "internal" | "qbo"; recordType: string; recordId: string; dedupeKey: string };
 export type Job = { id: string; side: string; record_type: string; record_id: string; attempts: number };
 type Write = { side: "internal" | "qbo"; action: "create" | "update"; entity: string; id: string; fields?: string[] };
-type Outcome = "synced" | "skipped" | "attention" | "failed";
+type Outcome = "synced" | "skipped" | "attention" | "conflict" | "paused" | "failed";
 
 const LEASE = "5 minutes";
 const MAX_ATTEMPTS = 10;
@@ -22,12 +22,17 @@ export async function recordHint(pool: pg.Pool, h: Hint): Promise<void> {
       [h.side, h.recordType, h.recordId, h.dedupeKey],
     );
     if (hint.rowCount === 0 || !SYNCED_TYPES.has(h.recordType)) return;
-    await c.query(
-      `INSERT INTO sync_jobs (side, record_type, record_id) VALUES ($1, $2, $3)
-       ON CONFLICT (side, record_type, record_id) WHERE status = 'pending' DO NOTHING`,
-      [h.side, h.recordType, h.recordId],
-    );
+    await enqueue(c, h.side, h.recordType, h.recordId);
   });
+}
+
+/** Queues a sync of one record, coalescing with a job already pending for it. */
+export async function enqueue(c: pg.PoolClient, side: "internal" | "qbo", recordType: string, recordId: string): Promise<void> {
+  await c.query(
+    `INSERT INTO sync_jobs (side, record_type, record_id) VALUES ($1, $2, $3)
+     ON CONFLICT (side, record_type, record_id) WHERE status = 'pending' DO NOTHING`,
+    [side, recordType, recordId],
+  );
 }
 
 export async function setAccountMapping(

@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS sync_attempts (
   link_id integer REFERENCES links(id),
   job_id bigint,
   trigger jsonb NOT NULL,
-  outcome text NOT NULL CHECK (outcome IN ('synced', 'skipped', 'attention', 'failed')),
+  outcome text NOT NULL,
   summary text NOT NULL,
   snapshots jsonb NOT NULL DEFAULT '{}',
   writes jsonb NOT NULL DEFAULT '[]',
@@ -62,3 +62,28 @@ CREATE TABLE IF NOT EXISTS account_mappings (
   qbo_ref text NOT NULL,
   PRIMARY KEY (kind, internal_key)
 );
+
+-- A Financial Field changed to different values on both Sides; the Link is paused until a person picks a Side.
+CREATE TABLE IF NOT EXISTS conflicts (
+  id serial PRIMARY KEY,
+  link_id integer NOT NULL REFERENCES links(id),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+  fields jsonb NOT NULL, -- [{ field, base, internal, qbo }]
+  winner text CHECK (winner IN ('internal', 'qbo')),
+  raised_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz
+);
+-- At most one open Conflict per Link.
+CREATE UNIQUE INDEX IF NOT EXISTS conflicts_one_open ON conflicts (link_id) WHERE status = 'open';
+
+-- Idempotent changes to tables created by earlier versions of this file.
+ALTER TABLE links ALTER COLUMN internal_id DROP NOT NULL;
+DO $$ BEGIN
+  -- Rebuild the outcome CHECK only when it predates the current list (avoids a table scan on every start).
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_attempts_outcome_check'
+                 AND pg_get_constraintdef(oid) LIKE '%paused%') THEN
+    ALTER TABLE sync_attempts DROP CONSTRAINT IF EXISTS sync_attempts_outcome_check;
+    ALTER TABLE sync_attempts ADD CONSTRAINT sync_attempts_outcome_check
+      CHECK (outcome IN ('synced', 'skipped', 'attention', 'conflict', 'paused', 'failed'));
+  END IF;
+END $$;

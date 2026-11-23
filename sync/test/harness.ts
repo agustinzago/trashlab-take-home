@@ -35,6 +35,7 @@ export async function setupSync() {
     "links",
     "sync_attempts",
     "account_mappings",
+    "conflicts",
   ]);
   const deps: SyncDeps = {
     pool,
@@ -75,6 +76,7 @@ export async function setupSync() {
   };
 
   const h = {
+    deps,
     pool,
     qbo,
     syncApp,
