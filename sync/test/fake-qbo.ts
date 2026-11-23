@@ -36,6 +36,13 @@ export type FakeQbo = {
   accountantVoid(id: string): any;
   /** An accountant hard-deletes an Invoice in QBO. */
   accountantDelete(id: string): void;
+  payments: any[];
+  undepositedFundsId: string;
+  addAccount(name: string): string;
+  /** An accountant receives a Payment in QBO: `applied` maps Invoice Id to amount. */
+  accountantPay(fields: { customerId: string; applied: Record<string, number>; txnDate?: string; ref?: string }): any;
+  accountantEditPayment(id: string, fields: object): any;
+  accountantVoidPayment(id: string): any;
   /** Fails the next `times` requests matching method and path (default: any POST). */
   injectFault(kind: FaultKind, opts?: { times?: number; method?: string; path?: RegExp }): void;
   /** Runs `fn` just before the next write is applied, e.g. a concurrent accountant edit. */
@@ -61,7 +68,9 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   // Strictly increasing timestamps, so last-writer-wins is deterministic in tests.
   let clock = Date.now();
   const now = () => new Date((clock += 1000)).toISOString();
-  const tables: Record<string, any[]> = { Customer: [], Item: [], Invoice: [] };
+  const tables: Record<string, any[]> = { Customer: [], Item: [], Invoice: [], Payment: [], Account: [] };
+  const undepositedFunds = { Id: "4", Name: "Undeposited Funds", AccountType: "Other Current Asset", AccountSubType: "UndepositedFunds" };
+  tables.Account.push(undepositedFunds);
   const events: QboEvent[] = [];
   const writes: FakeQbo["writes"] = [];
 
@@ -120,8 +129,9 @@ export async function startFakeQbo(): Promise<FakeQbo> {
       MetaData: { ...existing.MetaData, LastUpdatedTime: t },
     };
     tables.Invoice[idx] = updated;
+    refreshInvoice(id);
     emit("Invoice", id, "Update", t);
-    return updated;
+    return tables.Invoice[idx];
   }
 
   const faults: InjectedFault[] = [];
@@ -156,6 +166,70 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     tables.Invoice.splice(idx, 1);
     emit("Invoice", id, "Delete", now());
   }
+
+  // --- Payments: each Line applies an amount to one Invoice through LinkedTxn ---------
+
+  const appliedTo = (p: any) => p.Line.flatMap((l: any) => (l.LinkedTxn ?? []).filter((t: any) => t.TxnType === "Invoice").map((t: any) => t.TxnId));
+
+  /** QBO derives an Invoice's Balance and its LinkedTxn list from the Payments applied to it. */
+  function refreshInvoice(invoiceId: string) {
+    const inv = tables.Invoice.find((i) => i.Id === invoiceId);
+    if (!inv || String(inv.PrivateNote ?? "").startsWith("Voided")) return;
+    const payments = tables.Payment.filter((p) => appliedTo(p).includes(invoiceId));
+    const paid = payments.reduce(
+      (s, p) => s + p.Line.filter((l: any) => l.LinkedTxn?.some((t: any) => t.TxnId === invoiceId)).reduce((a: number, l: any) => a + l.Amount * 100, 0),
+      0,
+    );
+    inv.Balance = Math.round(inv.TotalAmt * 100 - paid) / 100;
+    inv.LinkedTxn = payments.filter((p) => p.TotalAmt !== 0).map((p) => ({ TxnId: p.Id, TxnType: "Payment" }));
+  }
+
+  function shapePayment(body: any) {
+    const customer = tables.Customer.find((c) => c.Id === body.CustomerRef?.value);
+    if (!customer) throw new Fault("2500", "Invalid Reference Id: CustomerRef");
+    for (const id of appliedTo(body)) {
+      const inv = tables.Invoice.find((i) => i.Id === id);
+      if (!inv) throw new Fault("2500", "Invalid Reference Id: LinkedTxn");
+      if (inv.CustomerRef.value !== customer.Id) throw new Fault("6000", "The payment and the invoice must be for the same customer");
+    }
+    const deposit = body.DepositToAccountRef?.value ?? undepositedFunds.Id;
+    if (!tables.Account.some((a) => a.Id === deposit)) throw new Fault("2500", "Invalid Reference Id: DepositToAccountRef");
+    return { ...body, CustomerRef: { value: customer.Id, name: customer.DisplayName }, DepositToAccountRef: { value: deposit } };
+  }
+
+  function createPayment(body: any) {
+    const t = now();
+    const payment = { ...shapePayment(body), Id: String(nextId++), SyncToken: "0", MetaData: { CreateTime: t, LastUpdatedTime: t } };
+    tables.Payment.push(payment);
+    appliedTo(payment).forEach(refreshInvoice);
+    emit("Payment", payment.Id, "Create", t);
+    return payment;
+  }
+
+  function changePayment(id: string, change: (p: any) => any, operation: QboEvent["operation"], syncToken: string | null) {
+    const idx = tables.Payment.findIndex((p) => p.Id === id);
+    if (idx < 0) throw new Fault("610", "Object Not Found");
+    const existing = tables.Payment[idx];
+    if (syncToken !== null && syncToken !== existing.SyncToken) throw new Fault("5010", "Stale Object Error");
+    const t = now();
+    tables.Payment[idx] = {
+      ...change(existing),
+      Id: id,
+      SyncToken: String(Number(existing.SyncToken) + 1),
+      MetaData: { ...existing.MetaData, LastUpdatedTime: t },
+    };
+    new Set([...appliedTo(existing), ...appliedTo(tables.Payment[idx])]).forEach((i) => refreshInvoice(i as string));
+    emit("Payment", id, operation, t);
+    return tables.Payment[idx];
+  }
+
+  const voidPayment = (id: string, syncToken: string | null) =>
+    changePayment(
+      id,
+      (p) => ({ ...p, TotalAmt: 0, Line: p.Line.map((l: any) => ({ ...l, Amount: 0 })), PrivateNote: `Voided${p.PrivateNote ? ` ${p.PrivateNote}` : ""}` }),
+      "Void",
+      syncToken,
+    );
 
   const app = Fastify({ logger: false });
   app.addHook("onRequest", async (req, reply) => {
@@ -235,6 +309,20 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     return { Invoice: invoice, time: now() };
   });
 
+  app.post(`${base}/payment`, async (req) => {
+    const body = req.body as any;
+    const operation = (req.query as { operation?: string }).operation;
+    if (operation === "void") return { Payment: voidPayment(body.Id, body.SyncToken), time: now() };
+    if (body.Id) throw new Fault("4000", "the fake does not model Payment updates by the sync");
+    return { Payment: createPayment(body), time: now() };
+  });
+
+  app.get(`${base}/payment/:id`, async (req) => {
+    const payment = tables.Payment.find((p) => p.Id === (req.params as { id: string }).id);
+    if (!payment) throw new Fault("610", "Object Not Found");
+    return { Payment: payment, time: now() };
+  });
+
   app.get(`${base}/invoice/:id`, async (req) => {
     const invoice = tables.Invoice.find((i) => i.Id === (req.params as { id: string }).id);
     if (!invoice) throw new Fault("610", "Object Not Found");
@@ -277,6 +365,19 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     accountantCreate: (fields) => createInvoice(fields),
     accountantEdit: (id, fields) => updateInvoice(id, fields, false),
     accountantVoid: (id) => voidInvoice(id, null),
+    payments: tables.Payment,
+    undepositedFundsId: undepositedFunds.Id,
+    addAccount: (name) => add("Account", { Name: name, AccountType: "Bank" }),
+    accountantPay: ({ customerId, applied, txnDate, ref }) =>
+      createPayment({
+        CustomerRef: { value: customerId },
+        TxnDate: txnDate ?? "2026-11-10",
+        PaymentRefNum: ref,
+        TotalAmt: Object.values(applied).reduce((a, b) => a + b, 0),
+        Line: Object.entries(applied).map(([invoiceId, amount]) => ({ Amount: amount, LinkedTxn: [{ TxnId: invoiceId, TxnType: "Invoice" }] })),
+      }),
+    accountantEditPayment: (id, fields) => changePayment(id, (p) => ({ ...p, ...fields }), "Update", null),
+    accountantVoidPayment: (id) => voidPayment(id, null),
     accountantDelete: (id) => deleteInvoice(id),
     close: () => app.close(),
   };

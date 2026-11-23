@@ -10,6 +10,19 @@ export type InternalInvoice = {
   status: "draft" | "issued" | "voided";
   version: number;
   updatedAt: string;
+  totalCents: number;
+  paidCents: number;
+};
+export type InternalPayment = {
+  id: number;
+  ref: string;
+  invoiceId: number;
+  amountCents: number;
+  txnDate: string;
+  method: string;
+  status: "active" | "voided";
+  version: number;
+  updatedAt: string;
 };
 export type InternalCustomer = { id: number; displayName: string };
 
@@ -42,6 +55,12 @@ export function createInternalClient(baseUrl: string) {
       send<InternalInvoice>("PATCH", `/invoices/${id}`, patch, { "if-match": String(version) }),
     voidInvoice: (id: number, version: number) =>
       send<InternalInvoice>("POST", `/invoices/${id}/void`, {}, { "if-match": String(version) }),
+    getPayment: (id: string | number) => get<InternalPayment>(`/payments/${id}`),
+    findPayments: async (ref: string) => (await get<InternalPayment[]>(`/payments?ref=${q(ref)}`))!,
+    createPayment: (body: object, idempotencyKey: string) =>
+      send<InternalPayment>("POST", "/payments", body, { "idempotency-key": idempotencyKey }),
+    voidPayment: (id: number, version: number) =>
+      send<InternalPayment>("POST", `/payments/${id}/void`, {}, { "if-match": String(version) }),
     getCustomer: (id: string | number) => get<InternalCustomer>(`/customers/${id}`),
     findCustomers: async (displayName: string) => (await get<InternalCustomer[]>(`/customers?displayName=${q(displayName)}`))!,
     createCustomer: (displayName: string, idempotencyKey: string) =>

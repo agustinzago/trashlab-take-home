@@ -53,7 +53,7 @@ A proposed Link between pre-existing records on both Sides that looks like a mat
 _Avoid_: fuzzy match, suggestion
 
 **Base**:
-The snapshot of an Invoice's fields as they were the last time both Sides agreed. Each Side's changes are measured against it.
+The snapshot of an Invoice's fields (or a Payment's amount and date) as they were the last time both Sides agreed. Each Side's changes are measured against it.
 _Avoid_: last state, previous version, ancestor
 
 **Change Hint**:

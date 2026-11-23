@@ -2,6 +2,7 @@ import type pg from "pg";
 import { tx } from "../../shared/db.ts";
 import type { SyncDeps } from "./app.ts";
 import { syncInvoice } from "./invoice-sync.ts";
+import { syncPayment } from "./payment-sync.ts";
 
 type Hint = { side: "internal" | "qbo"; recordType: string; recordId: string; dedupeKey: string };
 export type Job = { id: string; side: string; record_type: string; record_id: string; attempts: number; lease_token: string };
@@ -14,7 +15,7 @@ const MAX_ATTEMPTS = 10;
 export type RetryConfig = { transientBaseMs: number; staleMs: number; authMs: number };
 export const DEFAULT_RETRY: RetryConfig = { transientBaseMs: 1_000, staleMs: 500, authMs: 5 * 60_000 };
 
-export type ErrorClass = "transient" | "stale" | "auth" | "not_found" | "permanent";
+export type ErrorClass = "transient" | "waiting" | "stale" | "auth" | "not_found" | "permanent";
 
 /**
  * Sorts a failed call by what retrying can achieve. Both Side clients throw
@@ -22,6 +23,7 @@ export type ErrorClass = "transient" | "stale" | "auth" | "not_found" | "permane
  * one is a network failure or timeout, where the write may or may not have landed.
  */
 export function classify(err: any): ErrorClass {
+  if (err?.waiting === true) return "waiting"; // a Payment whose Invoice is not linked yet
   const status: number | undefined = err?.status;
   if (err?.code === "5010" || status === 409) return "stale"; // QBO stale SyncToken / internal If-Match
   if (status === 401) return "auth"; // expired or revoked connection: hold until reconnected
@@ -44,6 +46,9 @@ function retryDelay(cls: ErrorClass, attempts: number, cfg: RetryConfig): number
       return attempts >= MAX_ATTEMPTS ? null : Math.min(cfg.transientBaseMs * 2 ** (attempts - 1), 15 * 60_000) * (0.5 + Math.random());
     case "stale":
       return attempts >= MAX_ATTEMPTS ? null : cfg.staleMs;
+    case "waiting":
+      // Never given up (the Invoice may be fixed and linked much later): fast at first, then every authMs.
+      return attempts < MAX_ATTEMPTS ? Math.min(cfg.transientBaseMs * 2 ** (attempts - 1), cfg.authMs) : cfg.authMs;
     case "auth":
       return cfg.authMs; // held, never given up: work resumes once the connection is fixed
     default:
@@ -51,7 +56,7 @@ function retryDelay(cls: ErrorClass, attempts: number, cfg: RetryConfig): number
   }
 }
 // Record types that are synced so far; other hints are kept but start no job.
-const SYNCED_TYPES = new Set(["invoice"]);
+const SYNCED_TYPES = new Set(["invoice", "payment"]);
 
 /** Stores a Change Hint (dropping redeliveries) and coalesces it into one pending job per record. */
 export async function recordHint(pool: pg.Pool, h: Hint): Promise<void> {
@@ -164,7 +169,7 @@ export class Run {
 async function processJob(deps: SyncDeps, job: Job): Promise<void> {
   const run = new Run(job);
   try {
-    await syncInvoice(deps, run);
+    await (job.record_type === "payment" ? syncPayment(deps, run) : syncInvoice(deps, run));
   } catch (err) {
     if (err instanceof LeaseLost) return;
     const cls = classify(err);
