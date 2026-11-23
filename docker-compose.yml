@@ -1,0 +1,24 @@
+services:
+  internal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: internal
+      POSTGRES_PASSWORD: internal
+      POSTGRES_DB: internal
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "internal"]
+      interval: 2s
+      retries: 15
+
+  internal-system:
+    build: { context: ., dockerfile: internal-system/Dockerfile }
+    environment:
+      DATABASE_URL: postgres://internal:internal@internal-db:5432/internal
+      PORT: "3001"
+      WEBHOOK_URL: ${INTERNAL_WEBHOOK_URL:-http://sync:3000/webhooks/internal}
+      WEBHOOK_SECRET: ${INTERNAL_WEBHOOK_SECRET:-dev-internal-secret}
+      CHAOS: ${CHAOS:-0}
+    ports: ["3001:3001"]
+    depends_on:
+      internal-db: { condition: service_healthy }
