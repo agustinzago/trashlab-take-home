@@ -62,6 +62,17 @@ export function createQboClient(cfg: QboConfig) {
     async void(entity: string, body: { Id: string; SyncToken: string }, requestId?: string): Promise<any> {
       return (await call("POST", withRequestId(`${entity.toLowerCase()}?operation=void`, requestId), body))[entity];
     },
+    /** Change data capture: everything of these entities changed since `changedSince`, deletes included. */
+    async cdc(entities: string[], changedSince: string): Promise<{ entities: Record<string, any[]>; time: string }> {
+      const json = await call("GET", `cdc?entities=${entities.join(",")}&changedSince=${encodeURIComponent(changedSince)}`);
+      const found: Record<string, any[]> = {};
+      for (const response of json.CDCResponse ?? []) {
+        for (const q of response.QueryResponse ?? []) {
+          for (const [entity, rows] of Object.entries(q)) if (Array.isArray(rows)) (found[entity] ??= []).push(...rows);
+        }
+      }
+      return { entities: found, time: json.time };
+    },
     async get(entity: string, id: string): Promise<any> {
       return (await call("GET", `${entity.toLowerCase()}/${id}`))[entity];
     },

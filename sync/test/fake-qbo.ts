@@ -37,6 +37,8 @@ export type FakeQbo = {
   /** An accountant hard-deletes an Invoice in QBO. */
   accountantDelete(id: string): void;
   payments: any[];
+  /** The changedSince of every CDC request, in order. */
+  cdcRequests: string[];
   undepositedFundsId: string;
   addAccount(name: string): string;
   /** An accountant receives a Payment in QBO: `applied` maps Invoice Id to amount. */
@@ -160,11 +162,17 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     return voided;
   }
 
+  // Hard deletes leave a tombstone that change-data-capture reports with status "Deleted".
+  const tombstones: { entity: string; Id: string; LastUpdatedTime: string }[] = [];
+  const cdcRequests: string[] = [];
+
   function deleteInvoice(id: string) {
     const idx = tables.Invoice.findIndex((i) => i.Id === id);
     if (idx < 0) throw new Fault("610", "Object Not Found");
     tables.Invoice.splice(idx, 1);
-    emit("Invoice", id, "Delete", now());
+    const t = now();
+    tombstones.push({ entity: "Invoice", Id: id, LastUpdatedTime: t });
+    emit("Invoice", id, "Delete", t);
   }
 
   // --- Payments: each Line applies an amount to one Invoice through LinkedTxn ---------
@@ -309,6 +317,24 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     return { Invoice: invoice, time: now() };
   });
 
+  // Change data capture: every entity of the listed types changed at or after changedSince, deletes included.
+  app.get(`${base}/cdc`, async (req) => {
+    const { entities, changedSince } = req.query as { entities: string; changedSince: string };
+    const since = Date.parse(changedSince);
+    if (Number.isNaN(since)) throw new Fault("4000", "changedSince is required");
+    cdcRequests.push(changedSince);
+    const time = now();
+    const QueryResponse = entities.split(",").map((entity) => ({
+      [entity]: [
+        ...(tables[entity] ?? []).filter((r) => Date.parse(r.MetaData.LastUpdatedTime) >= since),
+        ...tombstones
+          .filter((d) => d.entity === entity && Date.parse(d.LastUpdatedTime) >= since)
+          .map((d) => ({ domain: "QBO", status: "Deleted", Id: d.Id, MetaData: { LastUpdatedTime: d.LastUpdatedTime } })),
+      ],
+    }));
+    return { CDCResponse: [{ QueryResponse }], time };
+  });
+
   app.post(`${base}/payment`, async (req) => {
     const body = req.body as any;
     const operation = (req.query as { operation?: string }).operation;
@@ -366,6 +392,7 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     accountantEdit: (id, fields) => updateInvoice(id, fields, false),
     accountantVoid: (id) => voidInvoice(id, null),
     payments: tables.Payment,
+    cdcRequests,
     undepositedFundsId: undepositedFunds.Id,
     addAccount: (name) => add("Account", { Name: name, AccountType: "Bank" }),
     accountantPay: ({ customerId, applied, txnDate, ref }) =>

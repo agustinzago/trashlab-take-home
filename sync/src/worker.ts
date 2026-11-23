@@ -55,8 +55,18 @@ function retryDelay(cls: ErrorClass, attempts: number, cfg: RetryConfig): number
       return null;
   }
 }
-// Record types that are synced so far; other hints are kept but start no job.
-const SYNCED_TYPES = new Set(["invoice", "payment"]);
+// Record types that are synced; other hints are kept but start no job.
+export const SYNCED_QBO_ENTITIES = ["Invoice", "Payment"];
+const SYNCED_TYPES = new Set(SYNCED_QBO_ENTITIES.map((e) => e.toLowerCase()));
+
+/**
+ * The dedupe key of a QBO Change Hint, shared by webhooks and the CDC poll so the
+ * same change seen both ways is stored once. Anything but a Delete is a "Change"
+ * (CDC cannot tell a create, an update and a void apart); Deletes stay distinct
+ * because only a reported Delete turns a QBO "not found" into a Void.
+ */
+export const qboHintKey = (entity: string, id: string, operation: string | undefined, lastUpdated: string | undefined) =>
+  `qbo:${entity}:${id}:${operation === "Delete" ? "Delete" : "Change"}:${lastUpdated ?? ""}`;
 
 /** Stores a Change Hint (dropping redeliveries) and coalesces it into one pending job per record. */
 export async function recordHint(pool: pg.Pool, h: Hint): Promise<void> {

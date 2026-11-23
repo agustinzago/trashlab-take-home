@@ -4,7 +4,7 @@ import type pg from "pg";
 import type { InternalClient } from "./internal.ts";
 import type { QboClient } from "./qbo.ts";
 import { registerAdmin } from "./admin.ts";
-import { recordHint, type RetryConfig } from "./worker.ts";
+import { qboHintKey, recordHint, type RetryConfig } from "./worker.ts";
 
 export type SyncDeps = {
   pool: pg.Pool;
@@ -87,7 +87,7 @@ export function buildSyncApp(deps: SyncDeps): FastifyInstance {
             side: "qbo",
             recordType: e.name.toLowerCase(),
             recordId: e.id,
-            dedupeKey: `qbo:${e.name}:${e.id}:${e.operation ?? ""}:${e.lastUpdated ?? ""}`,
+            dedupeKey: qboHintKey(e.name, e.id, e.operation, e.lastUpdated),
           });
         }
       }

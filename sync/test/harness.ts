@@ -72,8 +72,15 @@ export async function setupSync() {
     });
   };
 
-  const deliver = () =>
-    deliverDue(internalPool, { url: `${urlOf(syncApp)}/webhooks/internal`, secret: webhookSecret, chaos: false, retryBaseMs: 0 });
+  const deliver = (chaosRandom?: () => number) =>
+    deliverDue(internalPool, {
+      url: `${urlOf(syncApp)}/webhooks/internal`,
+      secret: webhookSecret,
+      chaos: !!chaosRandom,
+      chaosMaxDelayMs: 0,
+      random: chaosRandom,
+      retryBaseMs: 0,
+    });
   const deliverQbo = async () => {
     const pending = h.qbo.events.splice(0);
     if (pending.length) {
@@ -95,6 +102,13 @@ export async function setupSync() {
     /** Sends every queued fake-QBO change event to the sync service once. */
     deliverQbo,
     drain: () => drain(deps),
+    /** Delivers queued QBO change events messily: shuffled, some duplicated, some dropped for good. */
+    async deliverQboChaos(random: () => number, dropRate = 0.3) {
+      const pending = h.qbo.events.splice(0).filter(() => random() >= dropRate);
+      const messy = pending.flatMap((e) => (random() < 0.3 ? [e, e] : [e])).sort(() => random() - 0.5);
+      for (const e of messy) await sendQboWebhook([e]);
+      return messy.length;
+    },
     beforeNextInternalRequest: (method: string, path: RegExp, fn: () => Promise<unknown>) =>
       internalHooks.push({ method, path, fn }),
     /** Makes every waiting retry due now, as if its delay had passed. */

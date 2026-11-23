@@ -76,6 +76,12 @@ CREATE TABLE IF NOT EXISTS conflicts (
 -- At most one open Conflict per Link.
 CREATE UNIQUE INDEX IF NOT EXISTS conflicts_one_open ON conflicts (link_id) WHERE status = 'open';
 
+-- Where the QBO change-data-capture poll got to (one row).
+CREATE TABLE IF NOT EXISTS cdc_cursor (
+  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  cursor timestamptz NOT NULL
+);
+
 -- Idempotent changes to tables created by earlier versions of this file.
 ALTER TABLE links ALTER COLUMN internal_id DROP NOT NULL;
 -- The QBO requestid of a create in flight, kept on the pending Link so every retry reuses it.
