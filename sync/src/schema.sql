@@ -82,6 +82,8 @@ ALTER TABLE links ALTER COLUMN internal_id DROP NOT NULL;
 ALTER TABLE links ADD COLUMN IF NOT EXISTS pending_request_id text;
 -- Fences a claimed job: set at each claim, checked when the run settles it.
 ALTER TABLE sync_jobs ADD COLUMN IF NOT EXISTS lease_token uuid;
+-- Notes a person may need, e.g. an edit discarded because a Void won.
+ALTER TABLE sync_attempts ADD COLUMN IF NOT EXISTS notes jsonb NOT NULL DEFAULT '[]';
 DO $$ BEGIN
   -- Rebuild the outcome CHECK only when it predates the current list (avoids a table scan on every start).
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_attempts_outcome_check'

@@ -40,6 +40,8 @@ export function createInternalClient(baseUrl: string) {
     /** Carries the version we read; a concurrent edit makes this fail with 409 instead of overwriting it. */
     updateInvoice: (id: number, version: number, patch: object) =>
       send<InternalInvoice>("PATCH", `/invoices/${id}`, patch, { "if-match": String(version) }),
+    voidInvoice: (id: number, version: number) =>
+      send<InternalInvoice>("POST", `/invoices/${id}/void`, {}, { "if-match": String(version) }),
     getCustomer: (id: string | number) => get<InternalCustomer>(`/customers/${id}`),
     findCustomers: async (displayName: string) => (await get<InternalCustomer[]>(`/customers?displayName=${q(displayName)}`))!,
     createCustomer: (displayName: string, idempotencyKey: string) =>

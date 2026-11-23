@@ -16,7 +16,8 @@ export class QboError extends Error {
 
 const MINOR_VERSION = "75";
 
-const withRequestId = (path: string, requestId?: string) => (requestId ? `${path}?requestid=${encodeURIComponent(requestId)}` : path);
+const withRequestId = (path: string, requestId?: string) =>
+  requestId ? `${path}${path.includes("?") ? "&" : "?"}requestid=${encodeURIComponent(requestId)}` : path;
 
 /** Thin client over the QBO Accounting API: query, create and read entities. */
 export function createQboClient(cfg: QboConfig) {
@@ -56,6 +57,10 @@ export function createQboClient(cfg: QboConfig) {
     /** QBO updates POST to the create endpoint with Id and SyncToken in the body. */
     async update(entity: string, body: { Id: string; SyncToken: string; [field: string]: unknown }, requestId?: string): Promise<any> {
       return (await call("POST", withRequestId(entity.toLowerCase(), requestId), body))[entity];
+    },
+    /** QBO's void keeps the record and zeroes it; it carries the SyncToken read, like an update. */
+    async void(entity: string, body: { Id: string; SyncToken: string }, requestId?: string): Promise<any> {
+      return (await call("POST", withRequestId(`${entity.toLowerCase()}?operation=void`, requestId), body))[entity];
     },
     async get(entity: string, id: string): Promise<any> {
       return (await call("GET", `${entity.toLowerCase()}/${id}`))[entity];

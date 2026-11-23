@@ -5,7 +5,7 @@ import { syncInvoice } from "./invoice-sync.ts";
 
 type Hint = { side: "internal" | "qbo"; recordType: string; recordId: string; dedupeKey: string };
 export type Job = { id: string; side: string; record_type: string; record_id: string; attempts: number; lease_token: string };
-type Write = { side: "internal" | "qbo"; action: "create" | "update"; entity: string; id: string; fields?: string[] };
+type Write = { side: "internal" | "qbo"; action: "create" | "update" | "void"; entity: string; id: string; fields?: string[] };
 type Outcome = "synced" | "skipped" | "attention" | "conflict" | "paused" | "failed";
 
 const LEASE = "5 minutes";
@@ -115,6 +115,8 @@ export class Run {
   job: Job;
   snapshots: Record<string, unknown> = {};
   writes: Write[] = [];
+  /** Things a person may need to know, e.g. an edit discarded because a Void won. */
+  notes: string[] = [];
   /** The Link this run worked on, once known, so even a failed attempt shows in its history. */
   linkId: number | null = null;
   constructor(job: Job) {
@@ -129,8 +131,8 @@ export class Run {
     if (!("release" in db)) return tx(db, (c) => this.record(c, outcome, summary, linkId, error));
     await this.settle(db, outcome === "failed" ? null : { status: "done" });
     await db.query(
-      `INSERT INTO sync_attempts (link_id, job_id, trigger, outcome, summary, snapshots, writes, error)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      `INSERT INTO sync_attempts (link_id, job_id, trigger, outcome, summary, snapshots, writes, error, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
         linkId,
         this.job.id,
@@ -140,6 +142,7 @@ export class Run {
         JSON.stringify(this.snapshots),
         JSON.stringify(this.writes),
         error ?? null,
+        JSON.stringify(this.notes),
       ],
     );
   }

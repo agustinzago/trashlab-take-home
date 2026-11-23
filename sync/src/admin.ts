@@ -93,7 +93,7 @@ async function failedJobs(pool: pg.Pool) {
 
 async function attempts(pool: pg.Pool, linkId: number) {
   const { rows } = await pool.query(
-    "SELECT id, trigger, outcome, summary, writes, error, created_at FROM sync_attempts WHERE link_id = $1 ORDER BY id DESC",
+    "SELECT id, trigger, outcome, summary, writes, error, notes, created_at FROM sync_attempts WHERE link_id = $1 ORDER BY id DESC",
     [linkId],
   );
   return rows.map((r) => ({
@@ -103,6 +103,7 @@ async function attempts(pool: pg.Pool, linkId: number) {
     summary: r.summary,
     writes: r.writes,
     error: r.error,
+    notes: r.notes,
     at: r.created_at,
   }));
 }
@@ -228,13 +229,14 @@ async function adminRoutes(app: FastifyInstance, pool: pg.Pool, adminPassword: s
       <p>State: <strong>${esc(link.state)}</strong> &middot; internal ${esc(link.internal_id)} &middot; QBO ${esc(link.qbo_id)}</p>
       <h2>Sync Attempts</h2>
       ${table(
-        ["When", "Trigger", "Outcome", "Summary", "Writes", "Error"],
+        ["When", "Trigger", "Outcome", "Summary", "Writes", "Notes", "Error"],
         history.map((a) => [
           esc(a.at.toISOString()),
           esc(recordLabel(a.trigger.side, a.trigger.recordType, a.trigger.recordId)),
           esc(a.outcome),
           esc(a.summary),
           esc(a.writes.map((w: any) => `${w.action} ${w.side} ${w.entity} ${w.id}`).join("; ")),
+          esc(a.notes.join("; ")),
           esc(a.error),
         ]),
       )}`;

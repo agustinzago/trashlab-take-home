@@ -289,10 +289,11 @@ async function resumeCreate(deps: SyncDeps, run: Run, link: Link): Promise<void>
     return completeLink(deps.pool, run, link, id, link.base, `Adopted ${toQbo ? "QBO" : "internal"} Invoice ${toQbo ? found.Id : found.id} from an earlier attempt`);
   }
   const source = toQbo ? await deps.internal.getInvoice(link.internal_id!) : await getQboInvoice(deps, link.qbo_id!);
-  if (!source) {
+  const sourceVoided = source && (toQbo ? source.status === "voided" : isQboVoided(source));
+  if (!source || sourceVoided) {
     // Nothing was created and the source is gone: drop the Link so it cannot capture a later record.
     await deps.pool.query("DELETE FROM links WHERE id = $1", [link.id]);
-    return run.record(deps.pool, "skipped", `The source Invoice ${link.doc_number} disappeared before it was created on the other Side`);
+    return run.record(deps.pool, "skipped", `Invoice ${link.doc_number} was ${source ? "voided" : "removed"} before it was created on the other Side; nothing created`);
   }
   run.snapshots[toQbo ? "internal" : "qbo"] = source;
   return toQbo
@@ -312,16 +313,22 @@ async function internalCustomerName(deps: SyncDeps, inv: InternalInvoice): Promi
 async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
   const { pool, internal, qbo } = deps;
   run.linkId = link.id;
+  if (link.state === "closed") return run.record(pool, "skipped", "Link closed (voided); nothing to do", link.id);
+  const inv = await internal.getInvoice(link.internal_id!);
+  const q = await getQboInvoice(deps, link.qbo_id!);
+  run.snapshots = { base: link.base, internal: inv, qbo: q };
+  if (!inv) throw new NeedsAttention(`Internal Invoice ${link.internal_id} is gone, but a synced Invoice can only be voided`);
+  if (!q && !(await qboDeleteReported(pool, link.qbo_id!))) {
+    throw new NeedsAttention(`QBO says Invoice ${link.qbo_id} is not found, but no Delete was reported for it; check the QBO connection`);
+  }
+  // A Void wins over everything, an open Conflict included.
+  if (inv.status === "voided" || !q || isQboVoided(q)) return syncVoid(deps, run, link, inv, q);
   if (link.state === "paused") {
     // The hint is kept (change_hints); nothing is written until a person resolves the Conflict.
     return run.record(pool, "paused", "Paused by an open Conflict; nothing written", link.id);
   }
-  const inv = await internal.getInvoice(link.internal_id!);
-  const q = await getQboInvoice(deps, link.qbo_id!);
-  run.snapshots = { base: link.base, internal: inv, qbo: q };
-  if (!inv || !q || inv.status === "voided" || isQboVoided(q)) {
-    // ponytail: voids and deletes are handled by the Void and Delete ticket (#8).
-    return run.record(pool, "skipped", "A Side is voided or deleted; voids are not synced yet", link.id);
+  if (looksVoidedWithoutNote(q, link.base)) {
+    throw new NeedsAttention(`QBO Invoice ${q.Id} is zeroed but not marked "Voided"; not merging its zeroed lines`);
   }
 
   const result = merge({
@@ -383,6 +390,64 @@ async function syncPair(deps: SyncDeps, run: Run, link: Link): Promise<void> {
 }
 
 /**
+ * A Void on either Side wins over any edit on the other: the other Side is voided
+ * too (financial history is never deleted), the discarded edit is noted, and the
+ * Link is closed so later hints are no-ops.
+ */
+async function syncVoid(deps: SyncDeps, run: Run, link: Link, inv: InternalInvoice, q: any | null) {
+  const { pool } = deps;
+  const internalVoided = inv.status === "voided";
+  const qboVoided = !q || isQboVoided(q); // a QBO hard delete arrives internally as a Void
+  if (!internalVoided) {
+    const discarded = await discardedEdits(link.base, () => internalCustomerName(deps, inv).then((name) => normalizeInternal(inv, name)));
+    await deps.internal.voidInvoice(inv.id, inv.version);
+    run.writes.push({ side: "internal", action: "void", entity: "Invoice", id: String(inv.id) });
+    if (discarded) run.notes.push(`Void wins: discarded internal edit to ${discarded}`);
+  }
+  if (!qboVoided) {
+    const discarded = await discardedEdits(link.base, () => normalizeQbo(pool, q));
+    await deps.qbo.void("Invoice", { Id: q.Id, SyncToken: q.SyncToken }, requestIdFor("void", q.Id, q.SyncToken));
+    run.writes.push({ side: "qbo", action: "void", entity: "Invoice", id: q.Id });
+    if (discarded) run.notes.push(`Void wins: discarded QBO edit to ${discarded}`);
+  }
+  const origin = !q ? "Deleted in QBO" : internalVoided && qboVoided ? "Voided on both Sides" : internalVoided ? "Voided internally" : "Voided in QBO";
+  await tx(pool, async (c) => {
+    // A Void settles any open Conflict: there is nothing left to choose between.
+    await c.query("UPDATE conflicts SET status = 'resolved', resolved_at = now() WHERE link_id = $1 AND status = 'open'", [link.id]);
+    await c.query("UPDATE links SET state = 'closed', updated_at = now() WHERE id = $1", [link.id]);
+    const wrote = run.writes.length ? "voided the other Side" : "nothing to write";
+    await run.record(c, "synced", `${origin}; ${wrote}; Link closed${run.notes.length ? ` (${run.notes.join("; ")})` : ""}`, link.id);
+  });
+}
+
+/** The fields one Side changed since the Base, which a Void is about to discard; never blocks the Void. */
+async function discardedEdits(base: InvoiceFields, current: () => Promise<InvoiceFields>): Promise<string> {
+  try {
+    return changedSinceBase(base, await current()).join(", ");
+  } catch (err) {
+    return `(could not compare: ${err instanceof Error ? err.message : err})`;
+  }
+}
+
+/** Only a Delete notification (webhook or CDC) turns a QBO "not found" into a Void, never a bare 610. */
+async function qboDeleteReported(pool: pg.Pool, qboId: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    "SELECT 1 FROM change_hints WHERE side = 'qbo' AND record_type = 'invoice' AND record_id = $1 AND dedupe_key LIKE 'qbo:Invoice:%:Delete:%'",
+    [qboId],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** Every line zeroed while the Base had money on it, yet no "Voided" note: a void whose note was edited? */
+const looksVoidedWithoutNote = (q: any, base: InvoiceFields) =>
+  q.TotalAmt === 0 &&
+  base.lines.some((l) => l.amountCents !== 0) &&
+  (q.Line ?? []).filter((l: any) => l.DetailType === "SalesItemLineDetail").every((l: any) => l.Amount === 0);
+
+const changedSinceBase = (base: InvoiceFields, now: InvoiceFields) =>
+  (Object.keys(base) as (keyof InvoiceFields)[]).filter((f) => !isDeepStrictEqual(base[f], now[f]));
+
+/**
  * Brings one Invoice into agreement. The job names a record on one Side; a
  * linked pair goes through the merge, an unlinked record is created on the other Side.
  */
@@ -410,6 +475,10 @@ export async function syncInvoice(deps: SyncDeps, run: Run): Promise<void> {
     });
   } catch (err) {
     if (!(err instanceof NeedsAttention)) throw err;
-    await run.record(pool, "attention", err.message, run.linkId);
+    await tx(pool, async (c) => {
+      // Flag a linked pair so it shows on the admin page; the next clean run sets it back to linked.
+      if (run.linkId) await c.query("UPDATE links SET state = 'attention', updated_at = now() WHERE id = $1 AND state = 'linked'", [run.linkId]);
+      await run.record(c, "attention", err.message, run.linkId);
+    });
   }
 }

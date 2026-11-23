@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
  * QBO's JSON (PascalCase entities, string Ids and SyncTokens, Fault errors).
  * Every create/update is also queued in `events`, the way QBO would send a webhook.
  */
-export type QboEvent = { name: string; id: string; operation: "Create" | "Update"; lastUpdated: string };
+export type QboEvent = { name: string; id: string; operation: "Create" | "Update" | "Void" | "Delete"; lastUpdated: string };
 
 /**
  * Faults to inject into matching requests. A "timeout" drops the connection, so the
@@ -32,6 +32,10 @@ export type FakeQbo = {
   accountantCreate(fields: object): any;
   /** An accountant edits an Invoice in the QBO UI (sparse fields, Line replaces all lines). */
   accountantEdit(id: string, fields: object): any;
+  /** An accountant voids an Invoice in QBO: kept, zeroed, noted "Voided". */
+  accountantVoid(id: string): any;
+  /** An accountant hard-deletes an Invoice in QBO. */
+  accountantDelete(id: string): void;
   /** Fails the next `times` requests matching method and path (default: any POST). */
   injectFault(kind: FaultKind, opts?: { times?: number; method?: string; path?: RegExp }): void;
   /** Runs `fn` just before the next write is applied, e.g. a concurrent accountant edit. */
@@ -125,6 +129,34 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   const replies = new Map<string, { statusCode: number; payload: string }>();
   const control = { requestIdDedupe: true, authExpired: false };
 
+  /** QBO's void: the record stays, its amounts are zeroed and PrivateNote says "Voided" (to confirm in the spike). */
+  function voidInvoice(id: string, syncToken: string | null) {
+    const idx = tables.Invoice.findIndex((i) => i.Id === id);
+    if (idx < 0) throw new Fault("610", "Object Not Found");
+    const existing = tables.Invoice[idx];
+    if (syncToken !== null && syncToken !== existing.SyncToken) throw new Fault("5010", "Stale Object Error");
+    const t = now();
+    const voided = {
+      ...existing,
+      Line: existing.Line.map((l: any) => ({ ...l, Amount: 0 })),
+      TotalAmt: 0,
+      Balance: 0,
+      PrivateNote: `Voided${existing.PrivateNote ? ` ${existing.PrivateNote}` : ""}`,
+      SyncToken: String(Number(existing.SyncToken) + 1),
+      MetaData: { ...existing.MetaData, LastUpdatedTime: t },
+    };
+    tables.Invoice[idx] = voided;
+    emit("Invoice", id, "Void", t);
+    return voided;
+  }
+
+  function deleteInvoice(id: string) {
+    const idx = tables.Invoice.findIndex((i) => i.Id === id);
+    if (idx < 0) throw new Fault("610", "Object Not Found");
+    tables.Invoice.splice(idx, 1);
+    emit("Invoice", id, "Delete", now());
+  }
+
   const app = Fastify({ logger: false });
   app.addHook("onRequest", async (req, reply) => {
     if (control.authExpired || !req.headers.authorization?.startsWith("Bearer ")) {
@@ -197,6 +229,8 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   // QBO uses one endpoint for create and update: a body with Id is an update.
   app.post(`${base}/invoice`, async (req) => {
     const body = req.body as any;
+    const operation = (req.query as { operation?: string }).operation;
+    if (operation === "void") return { Invoice: voidInvoice(body.Id, body.SyncToken), time: now() };
     const invoice = body.Id ? updateInvoice(body.Id, body, true) : createInvoice(body);
     return { Invoice: invoice, time: now() };
   });
@@ -242,6 +276,8 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     },
     accountantCreate: (fields) => createInvoice(fields),
     accountantEdit: (id, fields) => updateInvoice(id, fields, false),
+    accountantVoid: (id) => voidInvoice(id, null),
+    accountantDelete: (id) => deleteInvoice(id),
     close: () => app.close(),
   };
 }
