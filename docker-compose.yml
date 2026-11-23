@@ -46,6 +46,7 @@ services:
       QBO_BASE_URL: ${QBO_BASE_URL:-https://sandbox-quickbooks.api.intuit.com}
       QBO_REALM_ID: ${QBO_REALM_ID:-}
       QBO_ACCESS_TOKEN: ${QBO_ACCESS_TOKEN:-}
+      QBO_WEBHOOK_VERIFIER: ${QBO_WEBHOOK_VERIFIER:-}
       ACCOUNT_MAPPING: ${ACCOUNT_MAPPING:-{}}
     ports: ["${SYNC_PORT:-3000}:3000"]
     depends_on:

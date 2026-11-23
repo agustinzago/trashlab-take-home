@@ -31,6 +31,7 @@ const deps = {
     getAccessToken: async () => accessToken,
   }),
   internalWebhookSecret: required("INTERNAL_WEBHOOK_SECRET"),
+  qboWebhookVerifier: required("QBO_WEBHOOK_VERIFIER"),
 };
 
 const app = buildSyncApp(deps);

@@ -10,14 +10,19 @@ export type SyncDeps = {
   internal: InternalClient;
   qbo: QboClient;
   internalWebhookSecret: string;
+  /** QBO's webhook verifier token, the HMAC key for the intuit-signature header. */
+  qboWebhookVerifier: string;
 };
 
-function signatureValid(raw: string, header: unknown, secret: string): boolean {
+function hmacMatches(expected: string, header: unknown): boolean {
   if (typeof header !== "string") return false;
-  const expected = Buffer.from("sha256=" + createHmac("sha256", secret).update(raw).digest("hex"));
-  const given = Buffer.from(header);
-  return given.length === expected.length && timingSafeEqual(given, expected);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(header);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
+
+const internalSignature = (raw: string, secret: string) => "sha256=" + createHmac("sha256", secret).update(raw).digest("hex");
+const qboSignature = (raw: string, verifier: string) => createHmac("sha256", verifier).update(raw).digest("base64");
 
 export function buildSyncApp(deps: SyncDeps): FastifyInstance {
   const app = Fastify();
@@ -44,7 +49,8 @@ export function buildSyncApp(deps: SyncDeps): FastifyInstance {
       },
       // Reject forgeries before validating or trusting anything in the body.
       preValidation: async (req, reply) => {
-        if (!signatureValid((req as any).rawBody ?? "", req.headers["x-signature"], deps.internalWebhookSecret)) {
+        const raw = (req as any).rawBody ?? "";
+        if (!hmacMatches(internalSignature(raw, deps.internalWebhookSecret), req.headers["x-signature"])) {
           return reply.code(401).send({ message: "invalid signature" });
         }
       },
@@ -53,6 +59,34 @@ export function buildSyncApp(deps: SyncDeps): FastifyInstance {
       const { deliveryId, type, id } = req.body as { deliveryId: string; type: string; id: number };
       await recordHint(deps.pool, { side: "internal", recordType: type, recordId: String(id), dedupeKey: `internal:${deliveryId}` });
       return reply.code(204).send();
+    },
+  );
+
+  // QBO webhooks list changed entities by name and id only; each becomes a Change Hint.
+  app.post(
+    "/webhooks/qbo",
+    {
+      preValidation: async (req, reply) => {
+        const raw = (req as any).rawBody ?? "";
+        if (!hmacMatches(qboSignature(raw, deps.qboWebhookVerifier), req.headers["intuit-signature"])) {
+          return reply.code(401).send({ message: "invalid signature" });
+        }
+      },
+    },
+    async (req, reply) => {
+      const body = req.body as { eventNotifications?: { dataChangeEvent?: { entities?: any[] } }[] };
+      for (const n of body.eventNotifications ?? []) {
+        for (const e of n.dataChangeEvent?.entities ?? []) {
+          if (typeof e?.name !== "string" || typeof e?.id !== "string") continue;
+          await recordHint(deps.pool, {
+            side: "qbo",
+            recordType: e.name.toLowerCase(),
+            recordId: e.id,
+            dedupeKey: `qbo:${e.name}:${e.id}:${e.operation ?? ""}:${e.lastUpdated ?? ""}`,
+          });
+        }
+      }
+      return reply.code(200).send();
     },
   );
 

@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
@@ -9,9 +10,11 @@ import { buildSyncApp, type SyncDeps } from "../src/app.ts";
 import { createInternalClient } from "../src/internal.ts";
 import { createQboClient } from "../src/qbo.ts";
 import { drain, setAccountMapping } from "../src/worker.ts";
-import { startFakeQbo, type FakeQbo } from "./fake-qbo.ts";
+import { startFakeQbo, type FakeQbo, type QboEvent } from "./fake-qbo.ts";
 
 export const webhookSecret = "internal-webhook-secret";
+export const qboWebhookVerifier = "qbo-verifier-token";
+export const signQbo = (body: string) => createHmac("sha256", qboWebhookVerifier).update(body).digest("base64");
 
 const urlOf = (app: FastifyInstance) => `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
 
@@ -38,6 +41,7 @@ export async function setupSync() {
     internal: createInternalClient(urlOf(internalApp)),
     qbo: createQboClient({ baseUrl: qbo.url, realmId: qbo.realmId, getAccessToken: async () => "test-token" }),
     internalWebhookSecret: webhookSecret,
+    qboWebhookVerifier,
   };
   const syncApp = buildSyncApp(deps);
   await syncApp.listen({ host: "127.0.0.1", port: 0 });
@@ -48,15 +52,48 @@ export async function setupSync() {
     return res.statusCode === 204 ? undefined : res.json();
   };
 
-  return {
+  /** Posts QBO change events to the sync service as a signed QBO webhook. */
+  const sendQboWebhook = (entities: QboEvent[]) => {
+    const body = JSON.stringify({ eventNotifications: [{ realmId: qbo.realmId, dataChangeEvent: { entities } }] });
+    return syncApp.inject({
+      method: "POST",
+      url: "/webhooks/qbo",
+      headers: { "content-type": "application/json", "intuit-signature": signQbo(body) },
+      payload: body,
+    });
+  };
+
+  const deliver = () =>
+    deliverDue(internalPool, { url: `${urlOf(syncApp)}/webhooks/internal`, secret: webhookSecret, chaos: false, retryBaseMs: 0 });
+  const deliverQbo = async () => {
+    const pending = h.qbo.events.splice(0);
+    if (pending.length) {
+      const res = await sendQboWebhook(pending);
+      if (res.statusCode >= 300) throw new Error(`QBO webhook -> ${res.statusCode} ${res.body}`);
+    }
+    return pending.length;
+  };
+
+  const h = {
     pool,
     qbo,
     syncApp,
     api,
+    sendQboWebhook,
     /** Sends every pending Internal System notification to the sync service once. */
-    deliver: () =>
-      deliverDue(internalPool, { url: `${urlOf(syncApp)}/webhooks/internal`, secret: webhookSecret, chaos: false, retryBaseMs: 0 }),
+    deliver,
+    /** Sends every queued fake-QBO change event to the sync service once. */
+    deliverQbo,
     drain: () => drain(deps),
+    /** Delivers notifications from both Sides and drains, until the echoes of our own writes die out. */
+    async settle() {
+      for (let i = 0; i < 10; i++) {
+        const delivered = (await deliver()) + (await deliverQbo());
+        const processed = await drain(deps);
+        if (delivered === 0 && processed === 0) return;
+      }
+      throw new Error("sync did not settle");
+    },
     mapRevenue: (category: string, itemId: string) => setAccountMapping(pool, "revenue_category", category, itemId),
     async close() {
       await syncApp.close();
@@ -66,6 +103,7 @@ export async function setupSync() {
       await internalPool.end();
     },
   };
+  return h;
 }
 
 export type SyncHarness = Awaited<ReturnType<typeof setupSync>>;

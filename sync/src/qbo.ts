@@ -50,6 +50,10 @@ export function createQboClient(cfg: QboConfig) {
     async create(entity: string, body: object): Promise<any> {
       return (await call("POST", entity.toLowerCase(), body))[entity];
     },
+    /** QBO updates POST to the create endpoint with Id and SyncToken in the body. */
+    async update(entity: string, body: { Id: string; SyncToken: string; [field: string]: unknown }): Promise<any> {
+      return (await call("POST", entity.toLowerCase(), body))[entity];
+    },
     async get(entity: string, id: string): Promise<any> {
       return (await call("GET", `${entity.toLowerCase()}/${id}`))[entity];
     },
