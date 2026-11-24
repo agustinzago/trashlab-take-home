@@ -25,31 +25,116 @@ This starts:
 | Internal System | <http://localhost:3001> | The invoicing API |
 | Mock QBO | <http://localhost:4000> | Stands in for QBO; already connected |
 
-The two Postgres databases start with them. Then, in the web console, create a customer and an issued Invoice. It appears in QBO with the same DocNumber, and its sync state and history show next to it.
-
-To watch the core scenarios run end to end (creates and edits both ways, a Conflict and its resolution, a duplicated notification, a Payment and a Void):
+The two Postgres databases start with them. The fastest check is the live run, which drives the core scenarios end to end through the running stack and prints what it verified: creates and edits both ways, a Conflict and its resolution, a duplicated notification, a Payment and a Void.
 
 ```bash
 docker compose run --rm sync node sync/scripts/live-run.ts
 ```
 
-The mock QBO answers the same Accounting API the sync uses, with any bearer token. For example, to list its Invoices:
-
-```bash
-curl -sG localhost:4000/v3/company/9130000000000000/query -H 'authorization: Bearer mock' --data-urlencode 'query=select * from Invoice'
-```
-
-The mock keeps its data in memory, so reset the whole stack rather than restarting it alone:
+The mock keeps its data in memory, so reset the whole stack rather than restarting the mock alone:
 
 ```bash
 docker compose down -v
 ```
 
-To make the Internal System duplicate, delay and reorder its notifications on purpose, start it with `CHAOS=1`:
+## Try it step by step
+
+This walks through every case in the brief by hand. The steps were run in this order on a fresh stack, so the ids shown match. If you have done other things first, read the ids and SyncTokens from the query output instead. Start clean:
+
+```bash
+docker compose down -v && docker compose up -d --build
+```
+
+Sign in to the web console at <http://localhost:8088> with `admin` / `admin`. Each Invoice's page shows its sync state and its Sync history: what changed, what was written and whether it succeeded. The Review page lists Conflicts, Link Candidates, Needs Attention items and failed jobs.
+
+The mock QBO has no screen, so its side is driven with `curl` against the same Accounting API endpoints QBO has. It accepts any bearer token, and sends its changes to the sync as signed webhooks every second. Set these once in your shell:
+
+```bash
+QBO=localhost:4000/v3/company/9130000000000000
+AUTH='authorization: Bearer mock'
+```
+
+**1. An Invoice created internally appears in QBO.** In the console, open Customers and add `Acme Ltd`. Then open New invoice and enter:
+
+- Invoice number `INV-1001`, customer Acme Ltd.
+- One line: `Advice`, revenue category `consulting`, amount `500.00`.
+
+Click Issue invoice. Its page shows it synced, and the history says "Created QBO Invoice 4 (DocNumber INV-1001)". In QBO:
+
+```bash
+curl -sG $QBO/query -H "$AUTH" --data-urlencode "query=select * from Invoice where DocNumber = 'INV-1001'"
+```
+
+It has the same DocNumber, customer and `TotalAmt` 500, with `"Id":"4"` and `"SyncToken":"0"`.
+
+**2. A QBO edit reaches the Internal System.** Change the due date in QBO, as a sparse update with the current SyncToken:
+
+```bash
+curl -s -XPOST $QBO/invoice -H "$AUTH" -H 'content-type: application/json' -d '{"Id":"4","SyncToken":"0","sparse":true,"DueDate":"2027-01-15"}'
+```
+
+Within a couple of seconds INV-1001 shows the new due date in the console, with a history entry for the run that copied it.
+
+**3. An Invoice created in QBO appears internally.**
+
+```bash
+curl -s -XPOST $QBO/invoice -H "$AUTH" -H 'content-type: application/json' -d '{"DocNumber":"INV-2001","CustomerRef":{"value":"3"},"TxnDate":"2026-11-02","Line":[{"DetailType":"SalesItemLineDetail","Amount":42,"Description":"Hosting","SalesItemLineDetail":{"ItemRef":{"value":"2"}}}]}'
+```
+
+INV-2001 appears in the console's invoice list: 42.00, revenue category `hosting`, linked to QBO Invoice 5. Customer `3` is Acme Ltd, which step 1 created in QBO, and Item `2` is Hosting.
+
+**4. A duplicated notification changes nothing.** Send the same signed QBO webhook for INV-2001 three times:
+
+```bash
+BODY='{"eventNotifications":[{"realmId":"9130000000000000","dataChangeEvent":{"entities":[{"name":"Invoice","id":"5","operation":"Update","lastUpdated":"2026-11-24T00:00:00Z"}]}}]}'
+SIG=$(printf %s "$BODY" | openssl dgst -sha256 -hmac dev-qbo-verifier -binary | base64)
+for i in 1 2 3; do curl -s -XPOST localhost:3000/webhooks/qbo -H 'content-type: application/json' -H "intuit-signature: $SIG" -d "$BODY"; done
+```
+
+All three are accepted, but they collapse into one pending job. INV-2001's history gains a run that says "No changes" and wrote nothing. QBO still has one INV-2001, still at SyncToken `0`.
+
+**5. The same Invoice edited in both systems.** Change INV-2001's line to 60 in QBO and to 70 internally. Paste both commands at once, so the sync sees both edits before it copies either:
+
+```bash
+curl -s -XPOST $QBO/invoice -H "$AUTH" -H 'content-type: application/json' -d '{"Id":"5","SyncToken":"0","sparse":true,"Line":[{"DetailType":"SalesItemLineDetail","Amount":60,"Description":"Hosting","SalesItemLineDetail":{"ItemRef":{"value":"2"}}}]}'
+curl -s -XPATCH localhost:3001/invoices/2 -H 'content-type: application/json' -H 'if-match: 1' -d '{"lines":[{"description":"Hosting","amountCents":7000,"revenueCategory":"hosting"}]}'
+```
+
+Lines are a Financial Field, and both Sides changed them differently, so the sync raises a Conflict and pauses the whole Invoice instead of guessing. Review → Conflicts shows the last agreed value (42.00) and both Sides' values. Pick Keep QBO or Keep Internal, and both Sides end equal.
+
+If the PATCH answers 409, the sync had already copied the QBO edit in between, so there is nothing to conflict with. Run the pair again with the new SyncToken and version.
+
+**6. Payments.** On INV-1001's page, click Record payment: `300.00`, method `check`, reference `CHK-1`. The page shows 300.00 paid and a 200.00 balance. In QBO:
+
+```bash
+curl -sG $QBO/query -H "$AUTH" --data-urlencode "query=select * from Payment where PaymentRefNum = 'CHK-1'"
+```
+
+That is a 300 Payment applied to QBO Invoice 4, whose `Balance` is now 200 (rerun the step 1 query to see it). Payment Status is never copied: each Side derives it from the Payments applied.
+
+**7. Void vs delete.** Void the CHK-1 payment from INV-1001's page, then void INV-1001 itself. Rerun both queries: the QBO Payment and Invoice now have `TotalAmt` 0 and `PrivateNote` "Voided", and INV-1001's history says its Link is closed.
+
+Delete is different. Only a draft can be deleted internally (Delete draft), and drafts never reach QBO. In QBO, an Invoice is treated as deleted only when a Delete notification confirms it, never on a not-found alone. A deleted QBO Invoice voids the internal one.
+
+**8. A partially paid Invoice edited.** Create and issue `INV-1002`: one `consulting` line of `500.00`. Record a `300.00` payment on it, then edit its line down to `200.00`. The new total would be below what is paid, so the sync doesn't push it. Review → Needs attention says "Internal edit would set the total to 200.00, below the 300.00 already paid in QBO". The same edit made in QBO, the book of record, would be accepted.
+
+**9. The ledger check.** Compare QBO's posted totals and balances with the Internal System's, read-only:
+
+```bash
+docker compose run --rm sync node sync/src/cli.ts reconcile
+```
+
+It lists INV-1002, which step 8 left different on purpose, with both Sides' totals and balances. Every other linked Invoice agrees.
+
+**10. Duplicated, delayed and reordered notifications.** Restart the Internal System with `CHAOS=1`, and it duplicates, delays and reorders its own notifications on purpose:
 
 ```bash
 CHAOS=1 docker compose up -d internal-system
 ```
+
+Create and edit a few Invoices in the console. Each still ends with one QBO Invoice that matches it, because a notification only says "look at this record": every run refetches both Sides, so order and repeats don't matter.
+
+**11. What can't be done by hand.** Timeouts after a write, 500 and 429 errors, retries after partial success and expired tokens need fault injection, so the tests cover them (see [Tests](#tests)). For example, `sync/test/write-safety.test.ts` covers a create that times out after QBO committed it and is retried, and a QBO write that succeeds while the internal write fails. Invoices that already exist on both Sides with no Link are adopted by the backfill command (see [Commands](#the-internal-system-api)), and `sync/test/backfill.test.ts` covers it.
 
 ## How the brief is covered
 
