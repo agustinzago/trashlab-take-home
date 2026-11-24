@@ -2,6 +2,8 @@
 
 Keeps receivable Invoices, and the Payments applied to them, in agreement between an Internal System and a QuickBooks Online (QBO) sandbox company, in both directions. It stays correct when notifications are duplicated, delayed, reordered or lost, and when either API times out after a write has landed.
 
+It is built against the real QBO Accounting API and verified on a QBO sandbox company: the spike script checked every QBO behaviour the design relies on, and the live run passed all 8 core scenarios there (see "Sandbox findings" in [docs/DESIGN.md](docs/DESIGN.md)). The bundled mock QBO exists only so the stack can be reviewed without an Intuit account; [Run against the QBO sandbox](#run-against-the-qbo-sandbox) switches to the real one.
+
 - **Design:** [docs/DESIGN.md](docs/DESIGN.md). How it works, write safety, tradeoffs and known limits.
 - **Vocabulary:** [CONTEXT.md](CONTEXT.md). Change Hint, Link, Base, Conflict and the other terms used below.
 - **Decisions:** [docs/adr/](docs/adr/). The three-way merge, and syncing the ledger through Account Mapping.
@@ -49,6 +51,29 @@ To make the Internal System duplicate, delay and reorder its notifications on pu
 CHAOS=1 docker compose up -d internal-system
 ```
 
+## How the brief is covered
+
+Tests are in `sync/test/` unless noted. The "how" column names the mechanism; [docs/DESIGN.md](docs/DESIGN.md) explains each one and its tradeoffs.
+
+| Requirement or edge case | How | Tests |
+|---|---|---|
+| Invoice creation, both ways | DocNumber is the shared identity; a Link joins the pair | [tracer](sync/test/tracer.test.ts), [two-way](sync/test/two-way.test.ts) |
+| Invoice updates | Three-way merge of both Sides against the Base stored on the Link | [two-way](sync/test/two-way.test.ts), [merge](sync/test/merge.test.ts) |
+| Deletes vs voids | Voids sync both ways. Internally only drafts can be deleted; a QBO hard delete becomes an internal Void, but only when a Delete notification confirms it | [void](sync/test/void.test.ts), [cdc](sync/test/cdc.test.ts) |
+| Payment status changes | Payments sync both ways (create and void); Payment Status is derived from them, never copied | [payments](sync/test/payments.test.ts), [internal payments](internal-system/test/payments.test.ts) |
+| Duplicate events | Every notification is a Change Hint: deduped, one pending job per record, and a run with no real change writes nothing | [tracer](sync/test/tracer.test.ts), [payments](sync/test/payments.test.ts), [two-way](sync/test/two-way.test.ts) |
+| Out-of-order or delayed events | Hints carry no data: each run refetches both Sides, so order doesn't matter. A CDC poll catches lost webhooks | [chaos](sync/test/chaos.test.ts), [cdc](sync/test/cdc.test.ts) |
+| Incomplete webhook payloads | Same: the full record is always refetched from its API | all of the above |
+| Conflicting edits in both systems | Financial fields edited on both Sides raise a Conflict that pauses the Invoice until a person picks a Side; cosmetic fields are last-writer-wins | [conflicts](sync/test/conflicts.test.ts), [merge](sync/test/merge.test.ts) |
+| Partially paid invoice edited | An internal edit that drops the total below what is paid is flagged; the same edit from QBO, the book of record, is accepted | [payments](sync/test/payments.test.ts) |
+| Timeout after a write | `requestid` replay, SyncToken on every update, and a pending Link with look-before-create | [write-safety](sync/test/write-safety.test.ts), [payments](sync/test/payments.test.ts) |
+| Retry after partial success | The QBO half is recorded in the Base before the internal write, so a retry only does the missing half | [write-safety](sync/test/write-safety.test.ts) |
+| Transient failures and retries | Errors are classified (transient, stale, auth, permanent…); backoff, leases, visible failed jobs | [write-safety](sync/test/write-safety.test.ts), [qbo-auth](sync/test/qbo-auth.test.ts) |
+| Existing invoices with no Link | Backfill links identical pairs and raises Link Candidates for differing ones | [backfill](sync/test/backfill.test.ts) |
+| Mapping: invoices and payments | Links (Invoices by DocNumber, Payments by ref ↔ `PaymentRefNum`) | [tracer](sync/test/tracer.test.ts), [payments](sync/test/payments.test.ts) |
+| Mapping: ledger entries and accounts | Account Mapping (revenue category → QBO Item, payment method → deposit account) and a read-only reconcile. No JournalEntries are written, because QBO already posts Invoices and Payments and they would double-count ([ADR 0002](docs/adr/0002-no-journal-entry-sync.md)) | [reconcile](sync/test/reconcile.test.ts), [tracer](sync/test/tracer.test.ts) |
+| Auditability | One Sync Attempt per run: what changed, what was written, and whether it succeeded, shown per Invoice in the console and admin page | [tracer](sync/test/tracer.test.ts), [conflicts](sync/test/conflicts.test.ts) |
+
 ## Layout
 
 ```
@@ -60,9 +85,9 @@ mock-qbo/          the fake QBO: used by the tests, and run as the mock-qbo serv
 web/               the web console: React + Vite, served by nginx, which also proxies both APIs
 ```
 
-## Use a real QBO sandbox instead
+## Run against the QBO sandbox
 
-Optional. You need an Intuit developer account with a sandbox company (one is created with the account).
+You need an Intuit developer account with a sandbox company (one is created with the account).
 
 1. On [developer.intuit.com](https://developer.intuit.com), create an app with the **com.intuit.quickbooks.accounting** scope. Under **Keys & credentials** (Development), note the Client ID and Client Secret, and add the redirect URI `http://localhost:3000/qbo/callback`.
 2. In the sandbox company, go to Settings → Account and settings → Sales → Sales form content, and turn on **Custom transaction numbers**. DocNumber is the shared identity, so the sync refuses to connect or start without it.
