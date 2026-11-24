@@ -11,6 +11,7 @@ internal-system/   the Internal System: REST API + transactional outbox of HMAC-
 sync/src/          the sync service: webhook ingest, CDC poll, queue + worker, merge, admin page, OAuth, CLI
 sync/scripts/      spike.ts (checks QBO's real behaviours) and live-run.ts (scenarios against the sandbox)
 sync/test/         integration tests against a fake QBO, plus the pure merge's unit tests
+web/               the web console: React + Vite, served by nginx, which also proxies both APIs
 ```
 
 ## Run it against a QBO sandbox
@@ -40,7 +41,7 @@ Fill in `.env`: `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `ADMIN_PASSWORD`, `INTERNA
 docker compose up -d --build
 ```
 
-This starts the Internal System on `:3001` and the sync service on `:3000`, each with its own Postgres.
+This starts the Internal System on `:3001`, the sync service on `:3000`, each with its own Postgres, and the web console on `:8088` (`WEB_PORT` changes it).
 
 ### 4. Connect QBO
 
@@ -83,7 +84,9 @@ Every change to an existing record (PATCH, issue, void, delete) needs `If-Match:
 
 Creates accept an `Idempotency-Key` header.
 
-**Admin page:** <http://localhost:3000/admin>. It lists Conflicts and Link Candidates (with buttons to pick a Side), Needs Attention items, failed jobs, and each Invoice's Sync Attempt history.
+**Web console:** <http://localhost:8088>. Sign in with `ADMIN_PASSWORD`. It covers the whole loop: create, edit, issue, void and delete Invoices, record and void Payments, see each Invoice's QBO sync state and Sync Attempt history, resolve Conflicts and Link Candidates, and connect or reconnect QBO. See [web/README.md](web/README.md).
+
+**Admin page:** <http://localhost:3000/admin>, the plain server-rendered fallback. It lists Conflicts and Link Candidates (with buttons to pick a Side), Needs Attention items, failed jobs, and each Invoice's Sync Attempt history.
 
 **Commands:**
 
@@ -120,6 +123,8 @@ npm test
 ```bash
 npm run typecheck
 ```
+
+The web console has its own package: `cd web && npm install && npm test && npm run build`.
 
 Everything is real except QBO, which is replaced by an in-memory fake QBO HTTP server (`sync/test/fake-qbo.ts`). The fake models the Accounting API subset in use (Invoices, Payments, voids, SyncToken checks, requestid replay, CDC, OAuth) with fault injection:
 

@@ -157,6 +157,32 @@ async function attempts(pool: pg.Pool, linkId: number) {
   }));
 }
 
+/** The QBO connection (never its tokens) and the queue's backlog, for the web console's header. */
+async function status(pool: pg.Pool) {
+  const [conn, jobs, cursor] = await Promise.all([
+    pool.query("SELECT realm_id, connected_at, refreshed_at, refresh_expires_at FROM qbo_connection WHERE id = 1"),
+    pool.query("SELECT status, count(*)::int AS n FROM sync_jobs WHERE status IN ('pending', 'running', 'failed') GROUP BY status"),
+    pool.query("SELECT cursor FROM cdc_cursor WHERE id = 1"),
+  ]);
+  const c = conn.rows[0];
+  const count = (s: string) => jobs.rows.find((r) => r.status === s)?.n ?? 0;
+  return {
+    qbo: c
+      ? { connected: true, realmId: c.realm_id, connectedAt: c.connected_at, refreshedAt: c.refreshed_at, refreshExpiresAt: c.refresh_expires_at }
+      : { connected: false },
+    jobs: { pending: count("pending"), running: count("running"), failed: count("failed") },
+    cdcCursor: cursor.rows[0]?.cursor ?? null,
+  };
+}
+
+// ponytail: unpaginated, like GET /invoices on the Internal System; add a cursor when volumes need it.
+async function invoiceLinks(pool: pg.Pool) {
+  const { rows } = await pool.query(
+    "SELECT id, internal_id, qbo_id, doc_number, state, updated_at FROM links WHERE record_type = 'invoice' ORDER BY id",
+  );
+  return rows.map((r) => ({ id: r.id, internalId: r.internal_id, qboId: r.qbo_id, docNumber: r.doc_number, state: r.state, updatedAt: r.updated_at }));
+}
+
 // --- HTML -------------------------------------------------------------------------
 
 const esc = (v: unknown) =>
@@ -234,6 +260,8 @@ async function adminRoutes(app: FastifyInstance, pool: pg.Pool, adminPassword: s
   app.get("/admin/api/attention", () => needsAttention(pool));
   app.get("/admin/api/failed-jobs", () => failedJobs(pool));
   app.get("/admin/api/links/:id/attempts", { schema: { params: idParams } }, (req) => attempts(pool, idOf(req)));
+  app.get("/admin/api/status", () => status(pool));
+  app.get("/admin/api/links", () => invoiceLinks(pool));
   // Each action twice: JSON for the API, a redirect back to the page for its form.
   for (const [url, fromForm, action] of [
     ["/admin/api/conflicts/:id/resolve", false, resolveConflict],

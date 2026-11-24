@@ -53,3 +53,8 @@ services:
     ports: ["${SYNC_PORT:-3000}:3000"]
     depends_on:
       sync-db: { condition: service_healthy }
+
+  web:
+    build: ./web
+    ports: ["${WEB_PORT:-8088}:8080"]
+    depends_on: [sync, internal-system]

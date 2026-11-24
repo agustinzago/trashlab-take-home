@@ -109,7 +109,7 @@ const page = (title: string, body: string) =>
 
 /** GET /admin/qbo/connect: sends the operator to Intuit's sign-in to pick a QBO company and consent (behind the admin password). */
 export function registerConnectRoute(app: FastifyInstance, pool: pg.Pool, oauth: OAuthConfig) {
-  app.get("/admin/qbo/connect", async (_req, reply) => {
+  const authorizeUrl = async () => {
     const state = randomBytes(24).toString("base64url");
     await pool.query("INSERT INTO oauth_states (state) VALUES ($1)", [state]);
     const url = new URL(oauth.authorizeUrl);
@@ -120,8 +120,11 @@ export function registerConnectRoute(app: FastifyInstance, pool: pg.Pool, oauth:
       redirect_uri: oauth.redirectUri,
       state,
     }).toString();
-    return reply.code(302).header("location", url.toString()).send();
-  });
+    return url.toString();
+  };
+  app.get("/admin/qbo/connect", async (_req, reply) => reply.code(302).header("location", await authorizeUrl()).send());
+  // For the web console: a top-level navigation carries no Authorization header, so it fetches the URL and goes there itself.
+  app.post("/admin/api/qbo/connect", async () => ({ url: await authorizeUrl() }));
 }
 
 /** GET /qbo/callback: Intuit's sign-in returns here with a one-time code; exchange it and store the connection. */

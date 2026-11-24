@@ -90,6 +90,31 @@ describe("Admin", () => {
     await app.close();
   });
 
+  it("reports invoice Links and the connection status, never the tokens", async () => {
+    const customer = await h.api("POST", "/customers", { displayName: "Acme" });
+    const inv = await h.api("POST", "/invoices", {
+      docNumber: "INV-9",
+      customerId: customer.id,
+      txnDate: "2026-11-01",
+      lines: [line(100)],
+      status: "issued",
+    });
+    await h.settle();
+
+    const links = (await h.syncApp.inject({ method: "GET", url: "/admin/api/links" })).json();
+    expect(links).toEqual([expect.objectContaining({ internalId: String(inv.id), qboId: h.qbo.invoices[0].Id, docNumber: "INV-9", state: "linked" })]);
+
+    const before = (await h.syncApp.inject({ method: "GET", url: "/admin/api/status" })).json();
+    expect(before).toMatchObject({ qbo: { connected: false }, jobs: { pending: 0, running: 0, failed: 0 } });
+    await h.pool.query(
+      `INSERT INTO qbo_connection (realm_id, access_token, refresh_token, access_expires_at, refresh_expires_at)
+       VALUES ('realm-1', 'secret-access', 'secret-refresh', now(), now() + interval '100 days')`,
+    );
+    const res = await h.syncApp.inject({ method: "GET", url: "/admin/api/status" });
+    expect(res.json()).toMatchObject({ qbo: { connected: true, realmId: "realm-1" } });
+    expect(res.body).not.toContain("secret");
+  });
+
   it("escapes record data in the page", async () => {
     const customer = await h.api("POST", "/customers", { displayName: "Acme" });
     await h.api("POST", "/invoices", {

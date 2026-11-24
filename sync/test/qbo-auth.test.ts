@@ -54,6 +54,15 @@ describe("QBO connection (OAuth 2)", () => {
     });
   });
 
+  it("hands the web console the same sign-in URL as JSON, with a state the callback accepts", async () => {
+    const start = await app.inject({ method: "POST", url: "/admin/api/qbo/connect" });
+    const state = new URL(start.json().url).searchParams.get("state");
+
+    const res = await app.inject({ method: "GET", url: `/qbo/callback?code=good-code&state=${state}&realmId=${h.qbo.realmId}` });
+    expect(res.statusCode).toBe(200);
+    expect(await connection()).toMatchObject({ realm_id: h.qbo.realmId });
+  });
+
   it("stores the tokens from the callback, and they persist for a new process", async () => {
     const res = await connect();
 
