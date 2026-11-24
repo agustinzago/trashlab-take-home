@@ -144,3 +144,5 @@ One-sided invoices are copied across only with `--create-missing`. That opt-in g
 | Update with a stale `SyncToken` | Fault 5010 "Stale Object Error" | Classified as stale: refetch and re-merge |
 | CDC after a hard delete | `{domain: "QBO", status: "Deleted", Id, MetaData.LastUpdatedTime}` (with a UTC offset) | Delete hints match what the sync expects |
 | Refresh token reuse | This refresh returned the same refresh token, and the previous token was still honoured | A crash mid-refresh cannot leave the connection unusable |
+
+The live run (`sync/scripts/live-run.ts`) then verified 8 of 8 scenarios against the same sandbox through the running stack: creates both ways, edits both ways, a Conflict and its resolution, a duplicated hint, a Payment and a Void. A timeout after a write can't be induced there; the fault-injection tests cover it. `cli.ts reconcile` afterwards reported 0 mismatches across the linked Invoices.
