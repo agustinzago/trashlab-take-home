@@ -7,7 +7,7 @@ import { syncPayment } from "./payment-sync.ts";
 type Hint = { side: "internal" | "qbo"; recordType: string; recordId: string; dedupeKey: string };
 export type Job = { id: string; side: string; record_type: string; record_id: string; attempts: number; lease_token: string };
 type Write = { side: "internal" | "qbo"; action: "create" | "update" | "void"; entity: string; id: string; fields?: string[] };
-type Outcome = "synced" | "skipped" | "attention" | "conflict" | "paused" | "failed";
+type Outcome = "synced" | "skipped" | "attention" | "candidate" | "conflict" | "paused" | "failed";
 
 const LEASE = "5 minutes";
 const MAX_ATTEMPTS = 10;

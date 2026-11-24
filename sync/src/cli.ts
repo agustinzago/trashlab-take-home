@@ -1,8 +1,9 @@
 // Operator commands, e.g. `docker compose run --rm sync node sync/src/cli.ts reconcile`.
+import { backfill } from "./backfill.ts";
 import { depsFromEnv } from "./config.ts";
 import { reconcile } from "./reconcile.ts";
 
-const [command] = process.argv.slice(2);
+const [command, ...flags] = process.argv.slice(2);
 const deps = await depsFromEnv({ server: false });
 let exitCode = 0;
 try {
@@ -18,8 +19,18 @@ try {
       exitCode = report.mismatches.length ? 1 : 0;
       break;
     }
+    case "backfill": {
+      // Queues hints only; the running sync service's worker does the linking.
+      const report = await backfill(deps, { createMissing: flags.includes("--create-missing") });
+      console.log(
+        `Hinted ${report.hinted} Invoices (${report.pairs} same-DocNumber pairs). ` +
+          `Skipped one-sided: ${report.skippedOneSided.internal} internal, ${report.skippedOneSided.qbo} QBO` +
+          (report.skippedOneSided.internal + report.skippedOneSided.qbo ? " (use --create-missing to copy them)." : "."),
+      );
+      break;
+    }
     default:
-      console.error("usage: cli.ts reconcile");
+      console.error("usage: cli.ts reconcile | backfill [--create-missing]");
       exitCode = 2;
   }
 } finally {

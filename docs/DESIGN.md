@@ -105,7 +105,7 @@ A backfill command turns every invoice on both sides into a hint. The normal pat
 - links pairs with the same DocNumber whose fields are identical;
 - raises a **Link Candidate** when the fields differ. Nothing is created, and a person picks which side wins.
 
-One-sided invoices are copied across only with `--create-missing`. The same "look before create" check guards ordinary syncing, so an unlinked match can never be duplicated by accident.
+One-sided invoices are copied across only with `--create-missing`. That opt-in governs the backfill alone: a pre-existing Invoice that changes after the sync is running gets a Change Hint like any other and is synced, since keeping live changes in step is the sync's job. The same "look before create" check guards ordinary syncing, so an unlinked match can never be duplicated by accident.
 
 ## Tradeoffs and known limits
 

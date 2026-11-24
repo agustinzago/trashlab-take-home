@@ -1,7 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { tx } from "../../shared/db.ts";
+import { withInvoiceLock } from "./links.ts";
+import { SYNCED_FIELDS } from "./merge.ts";
 import { enqueue } from "./worker.ts";
 
 type Winner = "internal" | "qbo";
@@ -36,7 +39,52 @@ export async function resolveConflict(pool: pg.Pool, conflictId: number, winner:
   });
 }
 
+/**
+ * Confirms a Link Candidate the same way a Conflict is resolved: the Link is created
+ * with a Base equal to the losing Side's values as raised, so the next run copies
+ * the winner across. A loser edited since then conflicts on a Financial Field
+ * (a Cosmetic Field falls to last-writer-wins, as everywhere else).
+ * Runs under the Invoice's lock so it cannot interleave with a run on the same pair.
+ */
+export async function confirmCandidate(pool: pg.Pool, candidateId: number, winner: Winner) {
+  const doc = (await pool.query("SELECT doc_number FROM link_candidates WHERE id = $1", [candidateId])).rows[0]?.doc_number;
+  if (!doc) throw httpError(404, "link candidate not found");
+  return withInvoiceLock(pool, doc, () => confirmLocked(pool, candidateId, winner));
+}
+
+async function confirmLocked(pool: pg.Pool, candidateId: number, winner: Winner) {
+  return tx(pool, async (c) => {
+    const { rows } = await c.query("SELECT * FROM link_candidates WHERE id = $1 FOR UPDATE", [candidateId]);
+    const candidate = rows[0];
+    if (!candidate) throw httpError(404, "link candidate not found");
+    if (candidate.status !== "open") throw httpError(409, `link candidate is ${candidate.status}`);
+    const base = winner === "internal" ? candidate.qbo_fields : candidate.internal_fields;
+    const { rows: link } = await c.query(
+      `INSERT INTO links (record_type, internal_id, qbo_id, doc_number, state, base) VALUES ('invoice', $1, $2, $3, 'linked', $4)
+       ON CONFLICT DO NOTHING RETURNING id`,
+      [candidate.internal_id, candidate.qbo_id, candidate.doc_number, JSON.stringify(base)],
+    );
+    if (!link[0]) throw httpError(409, "one of these Invoices has been linked since");
+    await c.query("UPDATE link_candidates SET status = 'confirmed', winner = $2, confirmed_at = now() WHERE id = $1", [candidateId, winner]);
+    await enqueue(c, "internal", "invoice", candidate.internal_id);
+    return { id: candidateId, linkId: link[0].id, status: "confirmed", winner };
+  });
+}
+
 // --- Queries behind both the JSON API and the page ---------------------------------
+
+async function openCandidates(pool: pg.Pool) {
+  const { rows } = await pool.query("SELECT * FROM link_candidates WHERE status = 'open' ORDER BY id");
+  return rows.map((r) => ({
+    id: r.id,
+    docNumber: r.doc_number,
+    internalId: r.internal_id,
+    qboId: r.qbo_id,
+    internal: r.internal_fields,
+    qbo: r.qbo_fields,
+    raisedAt: r.raised_at,
+  }));
+}
 
 const recordLabel = (side: string, recordType: string, recordId: string) => `${side} ${recordType} ${recordId}`;
 
@@ -178,22 +226,44 @@ async function adminRoutes(app: FastifyInstance, pool: pg.Pool, adminPassword: s
   } as const;
 
   app.get("/admin/api/conflicts", () => openConflicts(pool));
+  app.get("/admin/api/candidates", () => openCandidates(pool));
   app.get("/admin/api/attention", () => needsAttention(pool));
   app.get("/admin/api/failed-jobs", () => failedJobs(pool));
   app.get("/admin/api/links/:id/attempts", { schema: { params: idParams } }, (req) => attempts(pool, idOf(req)));
-  // The same action twice: JSON for the API, a redirect back to the page for its form.
-  for (const [url, fromForm] of [
-    ["/admin/api/conflicts/:id/resolve", false],
-    ["/admin/conflicts/:id/resolve", true],
+  // Each action twice: JSON for the API, a redirect back to the page for its form.
+  for (const [url, fromForm, action] of [
+    ["/admin/api/conflicts/:id/resolve", false, resolveConflict],
+    ["/admin/conflicts/:id/resolve", true, resolveConflict],
+    ["/admin/api/candidates/:id/confirm", false, confirmCandidate],
+    ["/admin/candidates/:id/confirm", true, confirmCandidate],
   ] as const) {
     app.post(url, { schema: { params: idParams, body: winnerBody } }, async (req, reply) => {
-      const result = await resolveConflict(pool, idOf(req), (req.body as { winner: Winner }).winner);
+      const result = await action(pool, idOf(req), (req.body as { winner: Winner }).winner);
       return fromForm ? reply.code(303).header("location", "/admin").send() : result;
     });
   }
 
   app.get("/admin", async (_req, reply) => {
-    const [conflicts, attention, failed] = await Promise.all([openConflicts(pool), needsAttention(pool), failedJobs(pool)]);
+    const [conflicts, candidates, attention, failed] = await Promise.all([
+      openConflicts(pool),
+      openCandidates(pool),
+      needsAttention(pool),
+      failedJobs(pool),
+    ]);
+    const candidateRows = candidates.flatMap((c) =>
+      SYNCED_FIELDS.filter((f) => !isDeepStrictEqual(c.internal[f], c.qbo[f]))
+        .map((f, i) => [
+          i === 0 ? esc(c.docNumber) : "",
+          esc(f),
+          showValue(f, c.internal[f]),
+          showValue(f, c.qbo[f]),
+          i === 0
+            ? `<form method="post" action="/admin/candidates/${c.id}/confirm">
+                 <button name="winner" value="internal">Keep internal</button><button name="winner" value="qbo">Keep QBO</button>
+               </form>`
+            : "",
+        ]),
+    );
     const conflictRows = conflicts.flatMap((c) =>
       c.fields.map((f: any, i: number) => [
         i === 0 ? linkTo(c.linkId, c.docNumber) : "",
@@ -211,6 +281,8 @@ async function adminRoutes(app: FastifyInstance, pool: pg.Pool, adminPassword: s
     const body = `<h1>Invoice sync</h1>
       <h2>Conflicts (${conflicts.length})</h2>
       ${table(["Invoice", "Field", "Base", "Internal", "QBO", "Resolve"], conflictRows)}
+      <h2>Link Candidates (${candidates.length})</h2>
+      ${table(["Invoice", "Field", "Internal", "QBO", "Confirm"], candidateRows)}
       <h2>Needs Attention (${attention.length})</h2>
       ${table(["Invoice", "Record", "Why", "When"], attention.map((a) => [linkTo(a.linkId, a.docNumber ?? "-"), esc(a.record), esc(a.summary), esc(a.at.toISOString())]))}
       <h2>Failed jobs (${failed.length})</h2>

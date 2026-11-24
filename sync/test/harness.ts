@@ -42,6 +42,8 @@ export async function setupSync() {
     "sync_attempts",
     "account_mappings",
     "conflicts",
+    "link_candidates",
+    "cdc_cursor",
   ]);
   const deps: SyncDeps = {
     pool,
@@ -111,6 +113,8 @@ export async function setupSync() {
     },
     beforeNextInternalRequest: (method: string, path: RegExp, fn: () => Promise<unknown>) =>
       internalHooks.push({ method, path, fn }),
+    /** Drops the Internal System's undelivered notifications: records that pre-date the sync. */
+    forgetInternalNotifications: () => internalPool.query("DELETE FROM outbox WHERE delivered_at IS NULL"),
     /** Makes every waiting retry due now, as if its delay had passed. */
     advanceClock: () => pool.query("UPDATE sync_jobs SET next_run_at = now() WHERE status = 'pending'"),
     /** Delivers notifications from both Sides and drains, until the echoes of our own writes die out. */

@@ -47,6 +47,7 @@ export function createInternalClient(baseUrl: string) {
   const q = encodeURIComponent;
   return {
     getInvoice: (id: string | number) => get<InternalInvoice>(`/invoices/${id}`),
+    listInvoices: async () => (await get<InternalInvoice[]>("/invoices"))!,
     findInvoices: async (docNumber: string) => (await get<InternalInvoice[]>(`/invoices?docNumber=${q(docNumber)}`))!,
     createInvoice: (body: object, idempotencyKey: string) =>
       send<InternalInvoice>("POST", "/invoices", body, { "idempotency-key": idempotencyKey }),

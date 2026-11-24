@@ -19,6 +19,8 @@ export type InvoiceFields = {
 
 const FINANCIAL = ["customer", "txnDate", "lines"] as const;
 const COSMETIC = ["dueDate", "memo"] as const;
+/** Every field the merge compares (identity and Derived Fields aside). */
+export const SYNCED_FIELDS = [...FINANCIAL, ...COSMETIC];
 type Field = (typeof FINANCIAL)[number] | (typeof COSMETIC)[number];
 
 export type Conflict = { field: Field; base: unknown; internal: unknown; qbo: unknown };

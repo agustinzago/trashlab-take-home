@@ -76,6 +76,22 @@ CREATE TABLE IF NOT EXISTS conflicts (
 -- At most one open Conflict per Link.
 CREATE UNIQUE INDEX IF NOT EXISTS conflicts_one_open ON conflicts (link_id) WHERE status = 'open';
 
+-- A Link Candidate: pre-existing Invoices on both Sides with the same DocNumber but
+-- different fields, waiting for a person to pick a Side. Nothing is written until then.
+CREATE TABLE IF NOT EXISTS link_candidates (
+  id serial PRIMARY KEY,
+  doc_number text NOT NULL,
+  internal_id text NOT NULL,
+  qbo_id text NOT NULL,
+  internal_fields jsonb NOT NULL,
+  qbo_fields jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'open',
+  winner text CHECK (winner IN ('internal', 'qbo')),
+  raised_at timestamptz NOT NULL DEFAULT now(),
+  confirmed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS link_candidates_one_open ON link_candidates (doc_number) WHERE status = 'open';
+
 -- Where the QBO change-data-capture poll got to (one row).
 CREATE TABLE IF NOT EXISTS cdc_cursor (
   id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -95,9 +111,15 @@ ALTER TABLE sync_attempts ADD COLUMN IF NOT EXISTS notes jsonb NOT NULL DEFAULT 
 DO $$ BEGIN
   -- Rebuild the outcome CHECK only when it predates the current list (avoids a table scan on every start).
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_attempts_outcome_check'
-                 AND pg_get_constraintdef(oid) LIKE '%paused%') THEN
+                 AND pg_get_constraintdef(oid) LIKE '%candidate%') THEN
     ALTER TABLE sync_attempts DROP CONSTRAINT IF EXISTS sync_attempts_outcome_check;
     ALTER TABLE sync_attempts ADD CONSTRAINT sync_attempts_outcome_check
-      CHECK (outcome IN ('synced', 'skipped', 'attention', 'conflict', 'paused', 'failed'));
+      CHECK (outcome IN ('synced', 'skipped', 'attention', 'candidate', 'conflict', 'paused', 'failed'));
+  END IF;
+  -- 'closed': the pair was linked some other way (it became identical) before anyone confirmed it.
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'link_candidates_status_check'
+                 AND pg_get_constraintdef(oid) LIKE '%closed%') THEN
+    ALTER TABLE link_candidates DROP CONSTRAINT IF EXISTS link_candidates_status_check;
+    ALTER TABLE link_candidates ADD CONSTRAINT link_candidates_status_check CHECK (status IN ('open', 'confirmed', 'closed'));
   END IF;
 END $$;

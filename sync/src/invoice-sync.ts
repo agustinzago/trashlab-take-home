@@ -179,10 +179,8 @@ async function createInQbo(deps: SyncDeps, run: Run, inv: InternalInvoice): Prom
   if (inv.status === "draft") return run.record(deps.pool, "skipped", "Draft Invoices are never synced");
   if (inv.status === "voided") return run.record(deps.pool, "skipped", "Voided before it was ever synced; nothing to create");
   const existing = await deps.qbo.query("Invoice", ["DocNumber", inv.docNumber]);
-  if (existing.length) {
-    run.snapshots.qbo = existing[0];
-    throw new NeedsAttention(`QBO already has an unlinked Invoice with DocNumber ${inv.docNumber}`);
-  }
+  if (existing.length > 1) throw new NeedsAttention(`QBO has ${existing.length} Invoices with DocNumber ${inv.docNumber}; cannot tell which one is the match`);
+  if (existing.length) return adoptPreExisting(deps, run, inv, existing[0]);
   const fields = normalizeInternal(inv, await internalCustomerName(deps, inv));
   await itemsFor(deps.pool, fields.lines); // a missing Account Mapping is flagged before anything is written
   const link = await insertPendingLink(deps.pool, "invoice", String(inv.id), null, fields.docNumber, fields);
@@ -190,15 +188,55 @@ async function createInQbo(deps: SyncDeps, run: Run, inv: InternalInvoice): Prom
   await pushToQbo(deps, run, link, fields);
 }
 
+/**
+ * The same DocNumber already exists, unlinked, on both Sides (pre-existing data, or
+ * a backfill). Identical fields: link them, writing nothing. Different fields: a Link
+ * Candidate for a person to confirm; nothing is written or duplicated until then.
+ */
+async function adoptPreExisting(deps: SyncDeps, run: Run, inv: InternalInvoice, q: any): Promise<void> {
+  const { pool } = deps;
+  run.snapshots = { internal: inv, qbo: q };
+  if ((await findLink(pool, "invoice", "internal", String(inv.id))) || (await findLink(pool, "invoice", "qbo", q.Id))) {
+    throw new NeedsAttention(`DocNumber ${inv.docNumber} is already linked to another Invoice on one Side`);
+  }
+  if (inv.status === "draft") return run.record(pool, "skipped", "Draft Invoices are never synced"); // reached from the QBO Side
+  if ((inv.status === "voided") !== isQboVoided(q)) {
+    // Not a choice of field values: confirming the live Side would be undone by the Void anyway.
+    throw new NeedsAttention(`Pre-existing Invoice ${inv.docNumber} is voided on one Side only; void or reissue it by hand`);
+  }
+  const internal = normalizeInternal(inv, await internalCustomerName(deps, inv));
+  const qbo = await normalizeQbo(pool, q);
+  if (isDeepStrictEqual(internal, qbo)) {
+    await tx(pool, async (c) => {
+      const { rows } = await c.query(
+        `INSERT INTO links (record_type, internal_id, qbo_id, doc_number, state, base) VALUES ('invoice', $1, $2, $3, 'linked', $4) RETURNING id`,
+        [String(inv.id), q.Id, inv.docNumber, JSON.stringify(internal)],
+      );
+      // A Link Candidate raised while they differed is settled: they agree now.
+      await c.query("UPDATE link_candidates SET status = 'closed' WHERE doc_number = $1 AND status = 'open'", [inv.docNumber]);
+      await run.record(c, "synced", `Linked pre-existing identical Invoices (DocNumber ${inv.docNumber}); nothing written`, rows[0].id);
+    });
+    return;
+  }
+  await tx(pool, async (c) => {
+    await c.query(
+      `INSERT INTO link_candidates (doc_number, internal_id, qbo_id, internal_fields, qbo_fields) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (doc_number) WHERE status = 'open'
+       DO UPDATE SET internal_id = EXCLUDED.internal_id, qbo_id = EXCLUDED.qbo_id,
+         internal_fields = EXCLUDED.internal_fields, qbo_fields = EXCLUDED.qbo_fields`,
+      [inv.docNumber, String(inv.id), q.Id, JSON.stringify(internal), JSON.stringify(qbo)],
+    );
+    const differingFields = changedSinceBase(internal, qbo).join(", ");
+    await run.record(c, "candidate", `Link Candidate: pre-existing Invoices ${inv.docNumber} differ in ${differingFields}; waiting for a person to pick a Side`);
+  });
+}
+
 /** A QBO Invoice with no Link: create it internally, already issued. */
 async function createInternally(deps: SyncDeps, run: Run, q: any): Promise<void> {
   if (isQboVoided(q)) return run.record(deps.pool, "skipped", "Voided in QBO before it was ever synced; nothing to create");
   const fields = await normalizeQbo(deps.pool, q);
   const existing = await deps.internal.findInvoices(q.DocNumber);
-  if (existing.length) {
-    run.snapshots.internal = existing[0];
-    throw new NeedsAttention(`The Internal System already has an unlinked Invoice with DocNumber ${q.DocNumber}`);
-  }
+  if (existing.length) return adoptPreExisting(deps, run, existing[0], q);
   const link = await insertPendingLink(deps.pool, "invoice", null, q.Id, fields.docNumber, fields);
   run.linkId = link.id;
   await pushToInternal(deps, run, link, fields);
