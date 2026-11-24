@@ -72,12 +72,14 @@ curl -s -XPOST localhost:3001/customers -H 'content-type: application/json' -d '
 curl -s -XPOST localhost:3001/invoices -H 'content-type: application/json' -d '{"docNumber":"INV-1001","customerId":1,"txnDate":"2026-11-01","dueDate":"2026-12-01","memo":"Thanks","lines":[{"description":"Advice","amountCents":25000,"revenueCategory":"consulting"}],"status":"issued"}'
 ```
 
-Changes made in QBO come back the same way. The Internal System's API:
+Changes made in QBO come back the same way. On its first start the CDC poll looks back one hour, so older QBO Invoices wait for the backfill command below. The Internal System's API:
 
 - `POST/GET /customers`
-- `POST/GET/PATCH /invoices` (PATCH needs `If-Match: <version>`)
+- `POST/GET/PATCH /invoices`
 - `POST /invoices/:id/issue|void`, and `DELETE /invoices/:id` for drafts only
 - `POST/GET /payments` and `POST /payments/:id/void`
+
+Every change to an existing record (PATCH, issue, void, delete) needs `If-Match: <version>`; it returns 428 without one and 409 when the version is stale.
 
 Creates accept an `Idempotency-Key` header.
 

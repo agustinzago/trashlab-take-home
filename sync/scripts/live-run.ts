@@ -21,7 +21,8 @@ const results: { scenario: string; ok: boolean; detail: string }[] = [];
 async function api(method: string, path: string, body?: object, headers: Record<string, string> = {}) {
   const res = await fetch(internalUrl + path, {
     method,
-    headers: { "content-type": "application/json", ...headers },
+    // No content-type without a body: a JSON content-type with an empty body is rejected (400).
+    headers: { ...(body ? { "content-type": "application/json" } : {}), ...headers },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${method} ${path} -> ${res.status} ${await res.text()}`);
@@ -77,14 +78,16 @@ const customer =
 
 const docA = `${tag}-A`;
 await scenario("internal Invoice appears in QBO", async () => {
-  await api("POST", "/invoices", { docNumber: docA, customerId: customer.id, txnDate: "2026-11-01", memo: "live", lines: [line(10000)], status: "issued" });
+  // A due date up front, so QBO deriving one from terms doesn't echo back and bump the version mid-run.
+  await api("POST", "/invoices", { docNumber: docA, customerId: customer.id, txnDate: "2026-11-01", dueDate: "2026-12-01", memo: "live", lines: [line(10000)], status: "issued" });
   const q = await eventually(() => qboByDoc(docA));
   return `QBO Invoice ${q.Id}, total ${q.TotalAmt}`;
 });
 
 const docB = `${tag}-B`;
 await scenario("QBO Invoice appears internally", async () => {
-  const qboCustomer = (await qbo.query("Customer", ["DisplayName", "Live Run Customer"]))[0];
+  const qboCustomer =
+    (await qbo.query("Customer", ["DisplayName", "Live Run Customer"]))[0] ?? (await qbo.create("Customer", { DisplayName: "Live Run Customer" }));
   await qbo.create("Invoice", { DocNumber: docB, TxnDate: "2026-11-02", CustomerRef: { value: qboCustomer.Id }, Line: [qboLine(42)] });
   const inv = await eventually(() => internalByDoc(docB));
   return `internal Invoice ${inv.id}, total ${inv.totalCents / 100}`;
@@ -106,6 +109,7 @@ await scenario("QBO edit reaches the Internal System", async () => {
 
 await scenario("a Conflict pauses the Invoice and resolving it makes both Sides equal", async () => {
   // QBO first: the internal edit syncs at once, and then finds the QBO edit already there (both changed).
+  // ponytail: a CDC poll landing between the two edits copies QBO's lines first and the PATCH gets 409; rerun if so.
   const q = await qboByDoc(docA);
   await qbo.update("Invoice", { Id: q.Id, SyncToken: q.SyncToken, sparse: true, Line: [qboLine(80)] });
   const inv = await internalByDoc(docA);
@@ -118,6 +122,7 @@ await scenario("a Conflict pauses the Invoice and resolving it makes both Sides 
 
 await scenario("a duplicated hint changes nothing", async () => {
   const inv = await internalByDoc(docA);
+  const before = await qboByDoc(docA);
   const body = JSON.stringify({ deliveryId: `${tag}-dup`, type: "invoice", id: inv.id });
   const signature = "sha256=" + createHmac("sha256", required("INTERNAL_WEBHOOK_SECRET")).update(body).digest("hex");
   for (let i = 0; i < 2; i++) {
@@ -127,7 +132,8 @@ await scenario("a duplicated hint changes nothing", async () => {
   await new Promise((r) => setTimeout(r, 10_000));
   const matches = await qbo.query("Invoice", ["DocNumber", docA]);
   if (matches.length !== 1) throw new Error(`${matches.length} QBO Invoices with DocNumber ${docA}`);
-  return "still one QBO Invoice";
+  if (matches[0].SyncToken !== before.SyncToken) throw new Error(`the QBO Invoice was written again (SyncToken ${before.SyncToken} -> ${matches[0].SyncToken})`);
+  return "both accepted; still one QBO Invoice, not written again";
 });
 
 await scenario("a Payment reaches QBO, applied to its Invoice", async () => {
