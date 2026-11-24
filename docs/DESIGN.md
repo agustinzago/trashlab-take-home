@@ -22,13 +22,13 @@ Webhook payloads from either side are treated as **Change Hints**: "record X may
 - **Duplicates** are dropped at ingest by a per-hint dedupe key. Bursts also coalesce into one pending job per record (partial unique index). Even if both checks were bypassed, the rerun finds both sides equal to the **Base** and does nothing. Idempotency comes from the comparison itself, not from remembering which events were seen.
 - **Out of order or delayed** hints don't matter, because ordering is never used. A late hint just triggers a refetch of the current state.
 - **Incomplete payloads** are the normal case. QBO webhooks only carry the entity id, and the internal ones are equally thin.
-- **Missed webhooks** are caught by the QBO CDC poll. Each poll re-reads one minute of overlap and stores its cursor. CDC also reports hard deletes.
+- **Missed webhooks** are caught by the QBO CDC poll (at startup, then every minute). Each poll re-reads one minute of overlap and stores QBO's own clock as its cursor, only after every hint is recorded. CDC also reports hard deletes. Webhooks and CDC share one dedupe key, so a change seen both ways is stored once.
 
-Each run takes a Postgres advisory lock on the invoice's DocNumber. That serializes everything touching one invoice (its edits and its payments) across workers, while unrelated invoices sync in parallel.
+Each run takes a Postgres advisory lock on the invoice's DocNumber. That serializes everything touching one invoice (its edits and its payments) across workers, while unrelated invoices sync in parallel. Jobs are claimed with `SKIP LOCKED` and a lease, and fenced by a per-claim token, so a worker whose lease expired can't write a second Sync Attempt.
 
 ## Identity and Links
 
-DocNumber is the shared identity. It's an **Identity Field**: the merge never syncs a change to it and flags it instead. A **Link** stores both ids, the **Base** and a state (`pending`, `linked`, `paused`, `attention`, `closed`). Payments are linked by `ref`: the internal payment ref is written to QBO's `PaymentRefNum`, and QBO-originated payments get the ref `QBO-<id>`.
+DocNumber is the shared identity. It's an **Identity Field**: the merge never syncs a change to it and flags it instead. A **Link** stores both ids, the **Base** and a state (`pending`, `linked`, `paused`, `attention`, `closed`). Payments are linked by `ref`: the internal payment ref is written to QBO's `PaymentRefNum`, and QBO-originated payments get the ref `QBO-<id>`. A Payment's Link also points at its Invoice's Link, which gives it the Invoice's lock and scopes ref lookups to that Invoice.
 
 ## Merge and conflicts (ADR 0001)
 
@@ -43,9 +43,9 @@ Each side's current fields are compared with the Base, field by field:
 - **Cosmetic Fields:** dueDate and memo.
 - **Derived Fields** (total, balance, payment status) are never compared. They follow from lines and payments.
 
-A Conflict pauses the whole invoice, including its clean fields, so that a half-applied merge never needs explaining. Resolving a Conflict rewrites the Base: each conflicting field's Base value becomes the losing side's value. The next merge then sees only the winner as changed and propagates it with the ordinary code path. If the loser was edited again after the Conflict was raised, the field simply conflicts again, so a stale resolution can't silently overwrite an edit nobody has reviewed. Link Candidates are confirmed the same way.
+A Conflict pauses the whole invoice, including its clean fields, so that a half-applied merge never needs explaining. Resolving a Conflict rewrites the Base: each conflicting field's Base value becomes the losing side's value. The next merge then sees only the winner as changed and propagates it with the ordinary code path. If the loser was edited again after the Conflict was raised, a Financial Field simply conflicts again, so a stale resolution can't silently overwrite a money edit nobody has reviewed (a Cosmetic Field falls to last-writer-wins, as everywhere). Link Candidates are confirmed the same way. A Void wins over an open Conflict and settles it.
 
-LWW for Cosmetic Fields uses each system's own updatedAt, which is only as good as clock agreement between the two systems. That's acceptable for a memo and not for an amount, which is exactly where the line between Cosmetic and Financial is drawn.
+LWW for Cosmetic Fields uses each system's own updatedAt (a tie goes to QBO, the book of record), which is only as good as clock agreement between the two systems. That's acceptable for a memo and not for an amount, which is exactly where the line between Cosmetic and Financial is drawn.
 
 ## Writes and partial failure
 
@@ -57,17 +57,18 @@ Every write is guarded three ways:
 
 The full Base advances only after every write in a run succeeds. One refinement: once the QBO half of a run lands, the fields just written are recorded in the Base, because both Sides now hold them. If the internal write then fails, the retry refetches and sees only what is still missing, so only the internal half is written. Without that step, an internal edit made between our two writes would make our own QBO write look like a QBO edit and raise a false Conflict (or lose a Cosmetic Field to last-writer-wins). Both sequences have their own tests.
 
-Errors are classified as `transient` (timeout, 5xx, 429), `stale`, `auth`, `not_found` or `permanent`.
+Errors are classified as `transient` (timeout, 5xx, 429), `stale`, `auth`, `waiting`, `not_found` or `permanent`.
 
 - `transient` retries with jittered exponential backoff, up to 10 attempts.
 - `stale` retries in 500 ms.
-- `auth` retries every 5 minutes, so a lapsed connection holds work until someone reconnects.
+- `auth` retries every 5 minutes without spending attempts, so a lapsed or missing connection holds work until someone reconnects.
+- `waiting` (a Payment whose Invoice has no Link yet) backs off like `transient`, then keeps retrying every 5 minutes; it is never given up.
 - `permanent` fails the job and shows it on the admin page.
 - `not_found` also fails the job: the record vanished mid-run, and the next hint for it starts afresh.
 - `stale` is capped at the same 10 attempts as `transient`, so a record edited non-stop still surfaces.
 - An error with no HTTP reply counts as `transient` only for a timeout, a dropped connection or a lost database connection. Anything else (a bug, unexpected data) is `permanent`.
 
-Each run writes exactly one **Sync Attempt** row. It records the outcome, a summary, the merge plan, the snapshots of the Base and both sides, every write performed (including writes that landed before a failure) and any notes, such as edits discarded by a void.
+Each run writes exactly one **Sync Attempt** row. It records the outcome, a summary, the snapshots of the Base and both sides (with the merge result), every write performed (including writes that landed before a failure) and any notes, such as edits discarded by a void.
 
 ## Delete vs void
 
@@ -80,11 +81,11 @@ Each run writes exactly one **Sync Attempt** row. It records the outcome, a summ
 | Void or delete while the other side has payments applied | Needs Attention; payments are never auto-unlinked |
 | Void racing an edit | Void wins; the discarded edit is recorded in the attempt |
 
-QBO has no void flag. A voided Invoice or Payment shows `TotalAmt = 0` and a `PrivateNote` starting with "Voided", and that's what we detect (to be confirmed against the sandbox).
+QBO has no void flag. A voided Invoice or Payment shows `TotalAmt = 0` and a `PrivateNote` starting with "Voided", and that's what we detect (to be confirmed against the sandbox). Two guards keep a misread from voiding real receivables: a QBO "not found" counts as a hard delete only when a Delete notification (webhook or CDC) was received for it, and a QBO Invoice zeroed without a "Voided" note is Needs Attention rather than a merge of zeroed lines. A voided Invoice's Link is closed, so later hints are no-ops.
 
 ## Payments
 
-The scope is **receivables**: an Invoice, then a Payment received against it. Vendor bills (`Bill`/`BillPayment`) are payables and out of scope. Payments sync both ways and are create and void only. A change to an amount or date on either side is flagged, because editing money in place across systems is how ledgers drift; the fix is to void and re-enter. A QBO payment applied to several invoices is flagged rather than split. A payment hint that arrives before its invoice is linked retries with backoff and enqueues the invoice's sync.
+The scope is **receivables**: an Invoice, then a Payment received against it. Vendor bills (`Bill`/`BillPayment`) are payables and out of scope. Payments sync both ways and are create and void only. A change to an amount or date on either side is flagged, because editing money in place across systems is how ledgers drift; the fix is to void and re-enter. A QBO payment applied to several invoices (or moved to another one) is flagged rather than split or moved. A payment hint that arrives before its invoice is linked enqueues the invoice's sync and waits until it is linked. The deposit account comes from Account Mapping by payment method, else Undeposited Funds (found by its account sub-type, not its name).
 
 Editing a partially paid invoice:
 
@@ -96,16 +97,24 @@ Editing a partially paid invoice:
 QBO generates the AR, income and deposit postings from Invoices and Payments itself. Writing JournalEntries alongside them would double-count revenue. So "syncing the general ledger" here means two things:
 
 - **Account Mapping:** a revenue category maps to a QBO Item, which carries its income account. A payment method maps to a deposit account, defaulting to Undeposited Funds.
-- **A read-only reconciliation:** a reconcile command compares QBO's posted total and balance with the internal ones for every linked invoice.
+- **A read-only reconciliation:** `cli.ts reconcile` compares QBO's posted total and balance with the internal ones for every linked (not closed) invoice and lists the mismatches. It writes nothing.
 
 ## Pre-existing invoices with no Link
 
 A backfill command turns every invoice on both sides into a hint. The normal path then:
 
-- links pairs with the same DocNumber whose fields are identical;
-- raises a **Link Candidate** when the fields differ. Nothing is created, and a person picks which side wins.
+- links pairs with the same DocNumber whose fields are identical, writing nothing;
+- raises a **Link Candidate** when the fields differ. Nothing is created, and a person picks which side wins on the admin page;
+- flags a pair voided on one Side only, or several QBO Invoices sharing a DocNumber, as Needs Attention.
 
 One-sided invoices are copied across only with `--create-missing`. That opt-in governs the backfill alone: a pre-existing Invoice that changes after the sync is running gets a Change Hint like any other and is synced, since keeping live changes in step is the sync's job. The same "look before create" check guards ordinary syncing, so an unlinked match can never be duplicated by accident.
+
+## Operations
+
+- **Admin page** (`/admin`, HTTP Basic with `ADMIN_PASSWORD`, required at startup): open Conflicts and Link Candidates with Base and both values and buttons to pick a Side, Needs Attention items, failed jobs, and the Sync Attempt history per Link. A JSON API under `/admin/api` serves the same. Cross-site form posts are refused.
+- **QBO connection:** `/admin/qbo/connect` runs the OAuth 2 authorization-code flow; tokens live in the sync database and are refreshed under a row lock, both replaced in one statement.
+- **CLI** (`sync/src/cli.ts`): `backfill [--create-missing]`, `reconcile`, and `qbo-ids` (the Item and account ids Account Mapping needs).
+- **Scripts** (`sync/scripts/`): `spike.ts` checks the QBO behaviours this design assumes; `live-run.ts` drives the core scenarios against the sandbox.
 
 ## Tradeoffs and known limits
 

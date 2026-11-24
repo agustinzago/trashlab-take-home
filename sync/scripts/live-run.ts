@@ -38,12 +38,16 @@ async function admin(method: string, path: string, body?: object) {
 }
 /** Waits for the sync to make `probe` true (webhooks or the 60 s CDC poll), up to `seconds`. */
 async function eventually<T>(probe: () => Promise<T | undefined | false>, seconds = 150): Promise<T> {
+  let lastError = "";
   for (let waited = 0; waited < seconds; waited += 3) {
-    const value = await probe().catch(() => undefined);
+    const value = await probe().catch((err) => {
+      lastError = err.message; // reported if the wait runs out, rather than hidden
+      return undefined;
+    });
     if (value) return value;
     await new Promise((r) => setTimeout(r, 3000));
   }
-  throw new Error(`not reached within ${seconds}s`);
+  throw new Error(`not reached within ${seconds}s${lastError ? ` (last error: ${lastError})` : ""}`);
 }
 async function scenario(name: string, fn: () => Promise<string>) {
   process.stdout.write(`- ${name} ... `);
@@ -117,7 +121,8 @@ await scenario("a duplicated hint changes nothing", async () => {
   const body = JSON.stringify({ deliveryId: `${tag}-dup`, type: "invoice", id: inv.id });
   const signature = "sha256=" + createHmac("sha256", required("INTERNAL_WEBHOOK_SECRET")).update(body).digest("hex");
   for (let i = 0; i < 2; i++) {
-    await fetch(`${syncUrl}/webhooks/internal`, { method: "POST", headers: { "content-type": "application/json", "x-signature": signature }, body });
+    const res = await fetch(`${syncUrl}/webhooks/internal`, { method: "POST", headers: { "content-type": "application/json", "x-signature": signature }, body });
+    if (!res.ok) throw new Error(`the sync service refused the hint: ${res.status}`); // else this scenario would prove nothing
   }
   await new Promise((r) => setTimeout(r, 10_000));
   const matches = await qbo.query("Invoice", ["DocNumber", docA]);

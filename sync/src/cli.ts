@@ -29,8 +29,16 @@ try {
       );
       break;
     }
+    case "qbo-ids": {
+      // The ids ACCOUNT_MAPPING needs: Items for revenue categories, deposit accounts for payment methods.
+      for (const i of await deps.qbo.query("Item")) console.log(`Item     ${i.Id.padStart(5)}  ${i.Name} (${i.Type})`);
+      for (const a of await deps.qbo.query("Account")) {
+        if (["Bank", "Other Current Asset"].includes(a.AccountType)) console.log(`Account  ${a.Id.padStart(5)}  ${a.Name} (${a.AccountSubType ?? a.AccountType})`);
+      }
+      break;
+    }
     default:
-      console.error("usage: cli.ts reconcile | backfill [--create-missing]");
+      console.error("usage: cli.ts reconcile | backfill [--create-missing] | qbo-ids");
       exitCode = 2;
   }
 } finally {
