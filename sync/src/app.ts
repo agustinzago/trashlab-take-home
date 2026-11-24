@@ -4,6 +4,7 @@ import type pg from "pg";
 import type { InternalClient } from "./internal.ts";
 import type { QboClient } from "./qbo.ts";
 import { registerAdmin } from "./admin.ts";
+import { registerCallbackRoute, type OAuthConfig } from "./qbo-auth.ts";
 import { qboHintKey, recordHint, type RetryConfig } from "./worker.ts";
 
 export type SyncDeps = {
@@ -15,6 +16,8 @@ export type SyncDeps = {
   qboWebhookVerifier: string;
   /** When set, /admin requires HTTP Basic auth as admin:<password>. */
   adminPassword?: string;
+  /** The QBO OAuth app; when set, the connect and callback routes are served. */
+  oauth?: OAuthConfig;
   /** Retry delays per error class; defaults to production values. */
   retry?: RetryConfig;
 };
@@ -95,6 +98,7 @@ export function buildSyncApp(deps: SyncDeps): FastifyInstance {
     },
   );
 
-  registerAdmin(app, deps.pool, deps.adminPassword);
+  registerAdmin(app, deps.pool, deps.adminPassword, deps.oauth);
+  if (deps.oauth) registerCallbackRoute(app, deps.pool, deps.oauth);
   return app;
 }

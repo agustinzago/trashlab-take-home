@@ -44,11 +44,13 @@ export async function setupSync() {
     "conflicts",
     "link_candidates",
     "cdc_cursor",
+    "qbo_connection",
+    "oauth_states",
   ]);
   const deps: SyncDeps = {
     pool,
     internal: createInternalClient(urlOf(internalApp)),
-    qbo: createQboClient({ baseUrl: qbo.url, realmId: qbo.realmId, getAccessToken: async () => "test-token" }),
+    qbo: createQboClient({ baseUrl: qbo.url, getAuth: async () => ({ realmId: qbo.realmId, accessToken: "test-token" }) }),
     internalWebhookSecret: webhookSecret,
     qboWebhookVerifier,
     // Retry at once in tests, except a lapsed connection, which waits until the test advances the clock.

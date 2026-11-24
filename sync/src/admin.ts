@@ -4,6 +4,7 @@ import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { tx } from "../../shared/db.ts";
 import { withInvoiceLock } from "./links.ts";
+import { registerConnectRoute, type OAuthConfig } from "./qbo-auth.ts";
 import { SYNCED_FIELDS } from "./merge.ts";
 import { enqueue } from "./worker.ts";
 
@@ -188,8 +189,11 @@ const table = (headers: string[], rows: string[][]) =>
 const linkTo = (linkId: number | null, label: unknown) => (linkId ? `<a href="/admin/links/${linkId}">${esc(label)}</a>` : esc(label));
 
 /** Admin routes, in their own encapsulated scope so the form parser and auth hooks touch nothing else. */
-export function registerAdmin(root: FastifyInstance, pool: pg.Pool, adminPassword: string | undefined) {
-  root.register(async (app) => adminRoutes(app, pool, adminPassword));
+export function registerAdmin(root: FastifyInstance, pool: pg.Pool, adminPassword: string | undefined, oauth?: OAuthConfig) {
+  root.register(async (app) => {
+    await adminRoutes(app, pool, adminPassword);
+    if (oauth) registerConnectRoute(app, pool, oauth); // behind the same password
+  });
 }
 
 async function adminRoutes(app: FastifyInstance, pool: pg.Pool, adminPassword: string | undefined) {

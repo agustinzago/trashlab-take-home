@@ -3,7 +3,10 @@ import { migrate } from "../../shared/db.ts";
 import type { SyncDeps } from "./app.ts";
 import { createInternalClient } from "./internal.ts";
 import { createQboClient } from "./qbo.ts";
+import { createTokenStore, type OAuthConfig } from "./qbo-auth.ts";
 import { setAccountMapping } from "./worker.ts";
+
+type TokenStore = ReturnType<typeof createTokenStore>;
 
 export function required(name: string): string {
   const value = process.env[name];
@@ -15,7 +18,7 @@ export function required(name: string): string {
  * The sync service's dependencies from its environment, shared by the server and
  * the CLI. Only the server needs the webhook and admin secrets.
  */
-export async function depsFromEnv({ server }: { server: boolean }): Promise<SyncDeps> {
+export async function depsFromEnv({ server }: { server: boolean }): Promise<SyncDeps & { tokens: TokenStore }> {
   const pool = new pg.Pool({ connectionString: required("DATABASE_URL") });
   await migrate(pool, new URL("./schema.sql", import.meta.url));
 
@@ -25,16 +28,21 @@ export async function depsFromEnv({ server }: { server: boolean }): Promise<Sync
     for (const [key, ref] of Object.entries(entries)) await setAccountMapping(pool, kind as "revenue_category", key, ref);
   }
 
-  // ponytail: static access token until the OAuth connection (#2) stores and refreshes tokens.
-  const accessToken = required("QBO_ACCESS_TOKEN");
+  const oauth: OAuthConfig = {
+    clientId: required("QBO_CLIENT_ID"),
+    clientSecret: required("QBO_CLIENT_SECRET"),
+    redirectUri: required("QBO_REDIRECT_URI"),
+    authorizeUrl: process.env.QBO_AUTHORIZE_URL ?? "https://appcenter.intuit.com/connect/oauth2",
+    tokenUrl: process.env.QBO_TOKEN_URL ?? "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+    apiBaseUrl: process.env.QBO_BASE_URL ?? "https://sandbox-quickbooks.api.intuit.com",
+  };
+  const tokens = createTokenStore(pool, oauth);
   return {
     pool,
+    oauth,
+    tokens,
     internal: createInternalClient(required("INTERNAL_URL")),
-    qbo: createQboClient({
-      baseUrl: process.env.QBO_BASE_URL ?? "https://sandbox-quickbooks.api.intuit.com",
-      realmId: required("QBO_REALM_ID"),
-      getAccessToken: async () => accessToken,
-    }),
+    qbo: createQboClient({ baseUrl: oauth.apiBaseUrl, getAuth: tokens.getAuth }),
     internalWebhookSecret: server ? required("INTERNAL_WEBHOOK_SECRET") : "",
     qboWebhookVerifier: server ? required("QBO_WEBHOOK_VERIFIER") : "",
     // Fails closed: the admin page can resolve Conflicts, so it never runs open.

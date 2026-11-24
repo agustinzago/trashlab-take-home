@@ -92,6 +92,24 @@ CREATE TABLE IF NOT EXISTS link_candidates (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS link_candidates_one_open ON link_candidates (doc_number) WHERE status = 'open';
 
+-- The connected QBO company and its OAuth tokens (one row). A refresh replaces both tokens in one UPDATE.
+CREATE TABLE IF NOT EXISTS qbo_connection (
+  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  realm_id text NOT NULL,
+  access_token text NOT NULL,
+  refresh_token text NOT NULL,
+  access_expires_at timestamptz NOT NULL,
+  refresh_expires_at timestamptz NOT NULL,
+  connected_at timestamptz NOT NULL DEFAULT now(),
+  refreshed_at timestamptz
+);
+
+-- OAuth state values issued by /admin/qbo/connect, each accepted once by the callback.
+CREATE TABLE IF NOT EXISTS oauth_states (
+  state text PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- Where the QBO change-data-capture poll got to (one row).
 CREATE TABLE IF NOT EXISTS cdc_cursor (
   id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),

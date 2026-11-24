@@ -6,3 +6,4 @@ RUN npm ci --omit=dev
 COPY shared ./shared
 COPY internal-system/src ./internal-system/src
 COPY sync/src ./sync/src
+COPY sync/scripts ./sync/scripts

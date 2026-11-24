@@ -1,7 +1,8 @@
+export type QboAuth = { realmId: string; accessToken: string };
 export type QboConfig = {
   baseUrl: string;
-  realmId: string;
-  getAccessToken: () => Promise<string>;
+  /** The connected company and a current access token (refreshed as needed). */
+  getAuth: () => Promise<QboAuth>;
 };
 
 export class QboError extends Error {
@@ -23,10 +24,11 @@ const withRequestId = (path: string, requestId?: string) =>
 export function createQboClient(cfg: QboConfig) {
   async function call(method: string, path: string, body?: object): Promise<any> {
     const sep = path.includes("?") ? "&" : "?";
-    const res = await fetch(`${cfg.baseUrl}/v3/company/${cfg.realmId}/${path}${sep}minorversion=${MINOR_VERSION}`, {
+    const { realmId, accessToken } = await cfg.getAuth();
+    const res = await fetch(`${cfg.baseUrl}/v3/company/${realmId}/${path}${sep}minorversion=${MINOR_VERSION}`, {
       method,
       headers: {
-        authorization: `Bearer ${await cfg.getAccessToken()}`,
+        authorization: `Bearer ${accessToken}`,
         accept: "application/json",
         ...(body ? { "content-type": "application/json" } : {}),
       },
@@ -72,6 +74,13 @@ export function createQboClient(cfg: QboConfig) {
         }
       }
       return { entities: found, time: json.time };
+    },
+    /** Hard delete (used only by the spike script: the sync itself never deletes). */
+    async delete(entity: string, body: { Id: string; SyncToken: string }): Promise<any> {
+      return (await call("POST", `${entity.toLowerCase()}?operation=delete`, body))[entity];
+    },
+    async preferences(): Promise<any> {
+      return (await call("GET", "preferences")).Preferences;
     },
     async get(entity: string, id: string): Promise<any> {
       return (await call("GET", `${entity.toLowerCase()}/${id}`))[entity];

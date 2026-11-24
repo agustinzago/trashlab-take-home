@@ -44,8 +44,9 @@ services:
       INTERNAL_URL: http://internal-system:3001
       INTERNAL_WEBHOOK_SECRET: ${INTERNAL_WEBHOOK_SECRET:-dev-internal-secret}
       QBO_BASE_URL: ${QBO_BASE_URL:-https://sandbox-quickbooks.api.intuit.com}
-      QBO_REALM_ID: ${QBO_REALM_ID:-}
-      QBO_ACCESS_TOKEN: ${QBO_ACCESS_TOKEN:-}
+      QBO_CLIENT_ID: ${QBO_CLIENT_ID:-}
+      QBO_CLIENT_SECRET: ${QBO_CLIENT_SECRET:-}
+      QBO_REDIRECT_URI: ${QBO_REDIRECT_URI:-http://localhost:3000/qbo/callback}
       QBO_WEBHOOK_VERIFIER: ${QBO_WEBHOOK_VERIFIER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ACCOUNT_MAPPING: ${ACCOUNT_MAPPING:-{}}

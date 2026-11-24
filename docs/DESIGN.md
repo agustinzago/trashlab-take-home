@@ -115,4 +115,15 @@ One-sided invoices are copied across only with `--create-missing`. That opt-in g
 - **DocNumber must be settable in QBO** ("Custom transaction numbers" must be on; a startup check reads QBO Preferences to verify it). Without it there's no shared identity, and matching would have to fall back to heuristics.
 - **The queue is Postgres**, with `SKIP LOCKED` and leases. That's enough for this load, and transactional with the Link state. A broker becomes worth it at many realms or high volume.
 - **Single QBO company.** Multi-tenant support would key every table by realm.
+- **QBO connection.** OAuth 2 tokens are stored in plain text in the sync database and the client secret comes from the environment; fine for one operator-run company, a secrets store before anything shared. The connection can be renewed but never switched to another company, since Links, the CDC cursor and Account Mapping belong to one. "Custom transaction numbers" is checked when connecting and at startup only; turning it off later goes unnoticed until the next restart. The image ships the operator scripts (spike, live run), which write to the connected company when run.
 - **Payment edits** are flagged rather than synced. Auto void-and-recreate is possible but changes payment identity in the books, which an accountant should decide.
+
+## Sandbox findings
+
+Pending: `sync/scripts/spike.ts` checks each behaviour below against the real sandbox, and its output belongs here. Until then the fake QBO models these assumptions:
+
+- A void keeps the record with `TotalAmt` 0 and a `PrivateNote` starting with "Voided", for Invoices and Payments; a voided Payment drops out of its Invoice's `LinkedTxn`.
+- Repeating a write with the same `requestid` returns the original response for a short window; only successful writes are assumed replayed.
+- `DocNumber` is settable on create when Custom transaction numbers is on, and a duplicate is rejected (6140).
+- A Payment carries `PaymentRefNum` as sent, and the Invoice it pays lists it in `LinkedTxn` with a reduced `Balance`.
+- A stale `SyncToken` fails with Fault code 5010, and CDC reports a hard-deleted Invoice as `{status: "Deleted", Id}`.

@@ -53,7 +53,7 @@ export function startCdcPoller(deps: SyncDeps): () => void {
   const poll = async () => {
     if (running) return;
     running = true;
-    await pollCdc(deps).catch((err) => console.error("CDC poll failed", err));
+    await pollCdc(deps).catch((err) => console.error(`CDC poll failed: ${err.message}`));
     running = false;
   };
   void poll();

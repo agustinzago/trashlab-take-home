@@ -53,6 +53,13 @@ export type FakeQbo = {
   requestIdDedupe: boolean;
   /** While true every request is rejected as unauthorized, like an expired connection. */
   authExpired: boolean;
+  /** QBO's "Custom transaction numbers" preference (DocNumber settable). */
+  customTxnNumbers: boolean;
+  /** When true, only the latest access token issued by the fake OAuth endpoint is accepted. */
+  strictTokens: boolean;
+  /** OAuth: the client credentials the token endpoint accepts, and the requests it received. */
+  oauthClient: { id: string; secret: string };
+  tokenRequests: Record<string, string>[];
   close(): Promise<void>;
 };
 
@@ -139,7 +146,14 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   const faults: InjectedFault[] = [];
   const beforeWrite: (() => void)[] = [];
   const replies = new Map<string, { statusCode: number; payload: string }>();
-  const control = { requestIdDedupe: true, authExpired: false };
+  const control = { requestIdDedupe: true, authExpired: false, customTxnNumbers: true, strictTokens: false };
+  // Intuit's OAuth 2 token endpoint, modelled: authorization codes and refresh tokens are single-use, and a refresh rotates both tokens.
+  const oauthClient = { id: "fake-client-id", secret: "fake-client-secret" };
+  const tokenRequests: Record<string, string>[] = [];
+  let tokenSeq = 0;
+  let currentAccess: string | null = null;
+  let currentRefresh: string | null = null;
+  const issuedCodes = new Set(["good-code"]);
 
   /** QBO's void: the record stays, its amounts are zeroed and PrivateNote says "Voided" (to confirm in the spike). */
   function voidInvoice(id: string, syncToken: string | null) {
@@ -240,24 +254,30 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     );
 
   const app = Fastify({ logger: false });
+  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_req, body, done) =>
+    done(null, Object.fromEntries(new URLSearchParams(body as string))),
+  );
   app.addHook("onRequest", async (req, reply) => {
-    if (control.authExpired || !req.headers.authorization?.startsWith("Bearer ")) {
-      return reply.code(401).send({ fault: { error: [{ message: "AuthenticationFailed", detail: "Token expired", code: "3200" }] } });
-    }
     const path = req.url.split("?")[0];
     const fault = faults.find((f) => f.method === req.method && f.path.test(path));
-    if (!fault) return;
-    if (--fault.times <= 0) faults.splice(faults.indexOf(fault), 1);
-    if (fault.kind === "timeoutBeforeCommit") {
-      req.raw.socket.destroy();
-      return reply.hijack();
+    if (fault) {
+      if (--fault.times <= 0) faults.splice(faults.indexOf(fault), 1);
+      if (fault.kind === "timeoutBeforeCommit") {
+        req.raw.socket.destroy();
+        return reply.hijack();
+      }
+      if (fault.kind === "timeoutAfterCommit") {
+        (req as any).dropAfterCommit = true;
+      } else {
+        const message = fault.kind === 429 ? "ThrottleExceeded" : "An application error has occurred";
+        return reply.code(fault.kind).send({ Fault: { Error: [{ Message: message, code: fault.kind === 429 ? "003001" : "10000" }] } });
+      }
     }
-    if (fault.kind === "timeoutAfterCommit") {
-      (req as any).dropAfterCommit = true;
-      return;
+    if (path.startsWith("/oauth2/")) return; // the token endpoint authenticates the client with Basic auth
+    const bearer = req.headers.authorization?.replace(/^Bearer /, "");
+    if (control.authExpired || !req.headers.authorization?.startsWith("Bearer ") || (control.strictTokens && bearer !== currentAccess)) {
+      return reply.code(401).send({ fault: { error: [{ message: "AuthenticationFailed", detail: "Token expired", code: "3200" }] } });
     }
-    const message = fault.kind === 429 ? "ThrottleExceeded" : "An application error has occurred";
-    return reply.code(fault.kind).send({ Fault: { Error: [{ Message: message, code: fault.kind === 429 ? "003001" : "10000" }] } });
   });
   app.addHook("preHandler", async (req, reply) => {
     if (req.method === "GET") return;
@@ -287,7 +307,30 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     });
   });
 
+  app.post("/oauth2/v1/tokens/bearer", async (req, reply) => {
+    const body = req.body as Record<string, string>;
+    tokenRequests.push(body);
+    const expected = "Basic " + Buffer.from(`${oauthClient.id}:${oauthClient.secret}`).toString("base64");
+    if (req.headers.authorization !== expected) return reply.code(401).send({ error: "invalid_client" });
+    if (body.grant_type === "authorization_code") {
+      if (!issuedCodes.delete(body.code)) return reply.code(400).send({ error: "invalid_grant" });
+    } else if (body.grant_type === "refresh_token") {
+      if (!currentRefresh || body.refresh_token !== currentRefresh) return reply.code(400).send({ error: "invalid_grant" });
+    } else {
+      return reply.code(400).send({ error: "unsupported_grant_type" });
+    }
+    tokenSeq++;
+    currentAccess = `access-${tokenSeq}`;
+    currentRefresh = `refresh-${tokenSeq}`;
+    return { access_token: currentAccess, refresh_token: currentRefresh, token_type: "bearer", expires_in: 3600, x_refresh_token_expires_in: 8726400 };
+  });
+
   const base = `/v3/company/${realmId}`;
+
+  app.get(`${base}/preferences`, async () => ({
+    Preferences: { SalesFormsPrefs: { CustomTxnNumbers: control.customTxnNumbers } },
+    time: now(),
+  }));
 
   app.get(`${base}/query`, async (req) => {
     const sql = (req.query as { query: string }).query;
@@ -382,6 +425,20 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     set requestIdDedupe(v) {
       control.requestIdDedupe = v;
     },
+    get customTxnNumbers() {
+      return control.customTxnNumbers;
+    },
+    set customTxnNumbers(v) {
+      control.customTxnNumbers = v;
+    },
+    get strictTokens() {
+      return control.strictTokens;
+    },
+    set strictTokens(v) {
+      control.strictTokens = v;
+    },
+    oauthClient,
+    tokenRequests,
     get authExpired() {
       return control.authExpired;
     },
