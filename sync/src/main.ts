@@ -17,7 +17,7 @@ if (await deps.tokens.isConnected()) {
     console.warn(`Could not check QBO preferences (${err.message}); starting, sync work is held until QBO answers.`);
   });
 } else {
-  console.log("QBO is not connected yet: open /admin/qbo/connect. Sync work is held until then.");
+  console.log("QBO is not connected yet: connect it from the web console or /admin/qbo/connect. Sync work is held until then.");
 }
 const app = buildSyncApp(deps);
 await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 3000) });

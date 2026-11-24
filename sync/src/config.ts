@@ -6,7 +6,7 @@ import { createQboClient } from "./qbo.ts";
 import { createTokenStore, type OAuthConfig } from "./qbo-auth.ts";
 import { setAccountMapping } from "./worker.ts";
 
-type TokenStore = ReturnType<typeof createTokenStore>;
+type TokenStore = Pick<ReturnType<typeof createTokenStore>, "getAuth" | "isConnected">;
 
 export function required(name: string): string {
   const value = process.env[name];
@@ -28,6 +28,29 @@ export async function depsFromEnv({ server }: { server: boolean }): Promise<Sync
     for (const [key, ref] of Object.entries(entries)) await setAccountMapping(pool, kind as "revenue_category", key, ref);
   }
 
+  const common = {
+    pool,
+    internal: createInternalClient(required("INTERNAL_URL")),
+    internalWebhookSecret: server ? required("INTERNAL_WEBHOOK_SECRET") : "",
+    qboWebhookVerifier: server ? required("QBO_WEBHOOK_VERIFIER") : "",
+    // Fails closed: the admin page can resolve Conflicts, so it never runs open.
+    adminPassword: server ? required("ADMIN_PASSWORD") : undefined,
+  };
+
+  // Without an Intuit app configured, run against the mock QBO service (mock-qbo/), so the stack works
+  // out of the box. The mock accepts any token, so the "connection" is recorded once and never refreshed.
+  if (!process.env.QBO_CLIENT_ID) {
+    const baseUrl = required("QBO_MOCK_URL");
+    const realmId = process.env.QBO_MOCK_REALM ?? "9130000000000000";
+    await pool.query(
+      `INSERT INTO qbo_connection (id, realm_id, access_token, refresh_token, access_expires_at, refresh_expires_at)
+       VALUES (1, $1, 'mock', 'mock', now() + interval '100 years', now() + interval '100 years') ON CONFLICT (id) DO NOTHING`,
+      [realmId],
+    );
+    const tokens: TokenStore = { getAuth: async () => ({ realmId, accessToken: "mock" }), isConnected: async () => true };
+    return { ...common, tokens, qbo: createQboClient({ baseUrl, getAuth: tokens.getAuth }) };
+  }
+
   const oauth: OAuthConfig = {
     clientId: required("QBO_CLIENT_ID"),
     clientSecret: required("QBO_CLIENT_SECRET"),
@@ -37,15 +60,5 @@ export async function depsFromEnv({ server }: { server: boolean }): Promise<Sync
     apiBaseUrl: process.env.QBO_BASE_URL ?? "https://sandbox-quickbooks.api.intuit.com",
   };
   const tokens = createTokenStore(pool, oauth);
-  return {
-    pool,
-    oauth,
-    tokens,
-    internal: createInternalClient(required("INTERNAL_URL")),
-    qbo: createQboClient({ baseUrl: oauth.apiBaseUrl, getAuth: tokens.getAuth }),
-    internalWebhookSecret: server ? required("INTERNAL_WEBHOOK_SECRET") : "",
-    qboWebhookVerifier: server ? required("QBO_WEBHOOK_VERIFIER") : "",
-    // Fails closed: the admin page can resolve Conflicts, so it never runs open.
-    adminPassword: server ? required("ADMIN_PASSWORD") : undefined,
-  };
+  return { ...common, oauth, tokens, qbo: createQboClient({ baseUrl: oauth.apiBaseUrl, getAuth: tokens.getAuth }) };
 }

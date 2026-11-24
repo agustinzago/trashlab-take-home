@@ -6,64 +6,89 @@ Keeps receivable Invoices, and the Payments applied to them, in agreement betwee
 - **Vocabulary:** [CONTEXT.md](CONTEXT.md). Change Hint, Link, Base, Conflict and the other terms used below.
 - **Decisions:** [docs/adr/](docs/adr/). The three-way merge, and syncing the ledger through Account Mapping.
 
-```
-internal-system/   the Internal System: REST API + transactional outbox of HMAC-signed notifications
-sync/src/          the sync service: webhook ingest, CDC poll, queue + worker, merge, admin page, OAuth, CLI
-sync/scripts/      spike.ts (checks QBO's real behaviours) and live-run.ts (scenarios against the sandbox)
-sync/test/         integration tests against a fake QBO, plus the pure merge's unit tests
-web/               the web console: React + Vite, served by nginx, which also proxies both APIs
-```
+## Quick start (no accounts needed)
 
-## Run it against a QBO sandbox
-
-You need Docker, and an Intuit developer account with a sandbox company (one is created with the account).
-
-### 1. Create the QBO app
-
-1. On [developer.intuit.com](https://developer.intuit.com), create an app with the **com.intuit.quickbooks.accounting** scope.
-2. Under **Keys & credentials** (Development), note the Client ID and Client Secret.
-3. On the same page, add the redirect URI `http://localhost:3000/qbo/callback`.
-4. Optional: webhooks need a public URL, such as a tunnel to `localhost:3000/webhooks/qbo`. Subscribe to Invoice and Payment, then note the verifier token. Without webhooks the sync still catches every QBO change within a minute through the CDC poll.
-
-### 2. Prepare the sandbox company
-
-In the sandbox company, go to Settings → Account and settings → Sales → Sales form content, and turn on **Custom transaction numbers**. The DocNumber is the shared identity, so the sync refuses to connect or start without it.
-
-### 3. Configure and start
-
-```bash
-cp .env.example .env
-```
-
-Fill in `.env`: `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `ADMIN_PASSWORD`, `INTERNAL_WEBHOOK_SECRET`, and `QBO_WEBHOOK_VERIFIER` (any value if you skip webhooks).
+You need only Docker. Every setting has a working default, and QBO is replaced by a mock QBO service, so no `.env` file and no Intuit account are needed:
 
 ```bash
 docker compose up -d --build
 ```
 
-This starts the Internal System on `:3001`, the sync service on `:3000`, each with its own Postgres, and the web console on `:8088` (`WEB_PORT` changes it).
+This starts:
 
-### 4. Connect QBO
+| Service | Address | What it is |
+|---|---|---|
+| Web console | <http://localhost:8088> | Sign in with `admin` / `admin` |
+| Sync service | <http://localhost:3000> | Webhooks, worker, `/admin` page |
+| Internal System | <http://localhost:3001> | The invoicing API |
+| Mock QBO | <http://localhost:4000> | Stands in for QBO; already connected |
 
-Open <http://localhost:3000/admin/qbo/connect>, log in as `admin` with your `ADMIN_PASSWORD`, then sign in to Intuit and pick the sandbox company. The tokens are stored in the sync database and refreshed automatically. Until QBO is connected, sync work waits rather than fails.
+The two Postgres databases start with them. Then, in the web console, create a customer and an issued Invoice. It appears in QBO with the same DocNumber, and its sync state and history show next to it.
 
-### 5. Set the Account Mapping
-
-Each internal revenue category posts to a QBO Item, and each payment method deposits to a QBO account (the default is Undeposited Funds). List the ids:
-
-```bash
-docker compose run --rm sync node sync/src/cli.ts qbo-ids
-```
-
-Then set `ACCOUNT_MAPPING` in `.env`, for example `{"revenue_category":{"consulting":"1","hosting":"5"},"payment_method":{"check":"35"}}`, and restart:
+To watch the core scenarios run end to end (creates and edits both ways, a Conflict and its resolution, a duplicated notification, a Payment and a Void):
 
 ```bash
-docker compose up -d sync
+docker compose run --rm sync node sync/scripts/live-run.ts
 ```
 
-### 6. Use it
+The mock QBO answers the same Accounting API the sync uses, with any bearer token. For example, to list its Invoices:
 
-Create a customer and issue an Invoice in the Internal System. It appears in QBO with the same DocNumber:
+```bash
+curl -sG localhost:4000/v3/company/9130000000000000/query -H 'authorization: Bearer mock' --data-urlencode 'query=select * from Invoice'
+```
+
+The mock keeps its data in memory, so reset the whole stack rather than restarting it alone:
+
+```bash
+docker compose down -v
+```
+
+To make the Internal System duplicate, delay and reorder its notifications on purpose, start it with `CHAOS=1`:
+
+```bash
+CHAOS=1 docker compose up -d internal-system
+```
+
+## Layout
+
+```
+internal-system/   the Internal System: REST API + transactional outbox of HMAC-signed notifications
+sync/src/          the sync service: webhook ingest, CDC poll, queue + worker, merge, admin page, OAuth, CLI
+sync/scripts/      spike.ts (checks the real QBO sandbox) and live-run.ts (core scenarios end to end)
+sync/test/         integration tests against the fake QBO, plus the pure merge's unit tests
+mock-qbo/          the fake QBO: used by the tests, and run as the mock-qbo service
+web/               the web console: React + Vite, served by nginx, which also proxies both APIs
+```
+
+## Use a real QBO sandbox instead
+
+Optional. You need an Intuit developer account with a sandbox company (one is created with the account).
+
+1. On [developer.intuit.com](https://developer.intuit.com), create an app with the **com.intuit.quickbooks.accounting** scope. Under **Keys & credentials** (Development), note the Client ID and Client Secret, and add the redirect URI `http://localhost:3000/qbo/callback`.
+2. In the sandbox company, go to Settings → Account and settings → Sales → Sales form content, and turn on **Custom transaction numbers**. DocNumber is the shared identity, so the sync refuses to connect or start without it.
+3. Create a `.env` from the example and uncomment the three `QBO_*` lines with your values. With `QBO_CLIENT_ID` set, the mock is not used.
+
+   ```bash
+   cp .env.example .env
+   ```
+
+4. Restart the sync service, then connect QBO from the web console (or <http://localhost:3000/admin/qbo/connect>), signing in to Intuit and picking the sandbox company. Tokens are stored in the sync database and refreshed automatically; until QBO is connected, sync work waits rather than fails.
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+5. Point `ACCOUNT_MAPPING` in `.env` at the sandbox's Items and deposit accounts, then restart the sync service again. Each revenue category posts to a QBO Item, and each payment method deposits to an account (Undeposited Funds by default). List the ids with:
+
+   ```bash
+   docker compose run --rm sync node sync/src/cli.ts qbo-ids
+   ```
+
+QBO webhooks need a public URL, such as a tunnel to `localhost:3000/webhooks/qbo`; set `QBO_WEBHOOK_VERIFIER` to the app's verifier token. Without webhooks the CDC poll still catches every QBO change within a minute.
+
+## The Internal System API
+
+The web console covers the whole loop. The same works with `curl`: create a customer and issue an Invoice, and it appears in QBO with the same DocNumber.
 
 ```bash
 curl -s -XPOST localhost:3001/customers -H 'content-type: application/json' -d '{"displayName":"Acme Ltd"}'
@@ -84,7 +109,7 @@ Every change to an existing record (PATCH, issue, void, delete) needs `If-Match:
 
 Creates accept an `Idempotency-Key` header.
 
-**Web console:** <http://localhost:8088>. Sign in with `ADMIN_PASSWORD`. It covers the whole loop: create, edit, issue, void and delete Invoices, record and void Payments, see each Invoice's QBO sync state and Sync Attempt history, resolve Conflicts and Link Candidates, and connect or reconnect QBO. See [web/README.md](web/README.md).
+**Web console:** <http://localhost:8088>. Sign in with `ADMIN_PASSWORD` (`admin` by default). It covers the whole loop: create, edit, issue, void and delete Invoices, record and void Payments, see each Invoice's QBO sync state and Sync Attempt history, resolve Conflicts and Link Candidates, and connect or reconnect QBO. See [web/README.md](web/README.md).
 
 **Admin page:** <http://localhost:3000/admin>, the plain server-rendered fallback. It lists Conflicts and Link Candidates (with buttons to pick a Side), Needs Attention items, failed jobs, and each Invoice's Sync Attempt history.
 
@@ -101,8 +126,6 @@ Creates accept an `Idempotency-Key` header.
   ```bash
   docker compose run --rm sync node sync/src/cli.ts reconcile
   ```
-
-To see the sync cope with messy delivery, set `CHAOS=1` in `.env` and restart the Internal System. Its notifications are then duplicated, delayed and reordered.
 
 ## Tests
 
@@ -126,7 +149,7 @@ npm run typecheck
 
 The web console has its own package: `cd web && npm install && npm test && npm run build`.
 
-Everything is real except QBO, which is replaced by an in-memory fake QBO HTTP server (`sync/test/fake-qbo.ts`). The fake models the Accounting API subset in use (Invoices, Payments, voids, SyncToken checks, requestid replay, CDC, OAuth) with fault injection:
+Everything is real except QBO, which is replaced by an in-memory fake QBO HTTP server (`mock-qbo/fake-qbo.ts`, the same one the mock-qbo service runs). The fake models the Accounting API subset in use (Invoices, Payments, voids, SyncToken checks, requestid replay, CDC, OAuth) with fault injection:
 
 - timeouts before and after commit
 - 500 and 429 errors
@@ -135,17 +158,17 @@ Everything is real except QBO, which is replaced by an in-memory fake QBO HTTP s
 
 The pure merge has table-driven unit tests (`sync/test/merge.test.ts`). The chaos run (`sync/test/chaos.test.ts`) edits both Sides while notifications are duplicated, delayed, reordered and dropped. It checks that both Sides end equal, with no duplicates and one Link per pair.
 
-## Against the real sandbox
+## Scripts
 
-Both scripts write `SPIKE-*` or `LIVE-*` records to the connected company.
+Both write `SPIKE-*` or `LIVE-*` records to the connected QBO company.
 
-- **Spike.** Checks the QBO behaviours the design assumes: the void shape, requestid replay, DocNumber on create, PaymentRefNum and LinkedTxn, 5010, CDC deletes, and refresh-token reuse. Paste its output into "Sandbox findings" in [docs/DESIGN.md](docs/DESIGN.md), and adjust the fake where reality differs.
+- **Spike** (real sandbox only). Checks the QBO behaviours the design assumes: the void shape, requestid replay, DocNumber on create, PaymentRefNum and LinkedTxn, 5010, CDC deletes, and refresh-token reuse. Paste its output into "Sandbox findings" in [docs/DESIGN.md](docs/DESIGN.md), and adjust the fake where reality differs.
 
   ```bash
   docker compose run --rm sync node sync/scripts/spike.ts
   ```
 
-- **Live run.** Drives the core scenarios end to end through the running stack: creates and updates both ways, a Conflict and its resolution, a duplicated hint, a Payment and a Void. It prints what it verified. A timeout after a write can't be induced against the sandbox, so the fault-injection tests cover it.
+- **Live run** (mock or sandbox). Drives the core scenarios end to end through the running stack: creates and updates both ways, a Conflict and its resolution, a duplicated hint, a Payment and a Void. It prints what it verified. A timeout after a write can't be induced here, so the fault-injection tests cover it. Against the real sandbox it verified 8 of 8 (see "Sandbox findings" in [docs/DESIGN.md](docs/DESIGN.md)).
 
   ```bash
   docker compose run --rm sync node sync/scripts/live-run.ts

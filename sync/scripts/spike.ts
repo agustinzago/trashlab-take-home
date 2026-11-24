@@ -14,6 +14,10 @@ import { depsFromEnv } from "../src/config.ts";
 import { saveTokens, tokenRequest } from "../src/qbo-auth.ts";
 
 const deps = await depsFromEnv({ server: false });
+if (!deps.oauth) {
+  console.error("The spike checks the real QBO sandbox: set QBO_CLIENT_ID and QBO_CLIENT_SECRET (it is pointless against the mock).");
+  process.exit(2);
+}
 const { qbo } = deps;
 const findings: Record<string, unknown> = {};
 const tag = `SPIKE-${Date.now().toString(36).toUpperCase()}`;

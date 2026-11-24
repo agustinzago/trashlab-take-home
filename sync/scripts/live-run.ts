@@ -1,11 +1,11 @@
 /**
- * Live run (#13): drives the core scenarios end to end against the real QBO sandbox,
- * through the running stack (Internal System + sync service with its worker), and
- * prints what it verified. With the stack up and QBO connected:
+ * Live run (#13): drives the core scenarios end to end through the running stack
+ * (Internal System + sync service with its worker), against whichever QBO the stack
+ * uses (the mock by default, or the real sandbox), and prints what it verified:
  *
  *   docker compose run --rm sync node sync/scripts/live-run.ts
  *
- * It writes LIVE-* records to the Internal System and the sandbox company.
+ * It writes LIVE-* records to the Internal System and to QBO.
  */
 import { createHmac } from "node:crypto";
 import { depsFromEnv, required } from "../src/config.ts";
@@ -156,8 +156,8 @@ await scenario("an internal Void voids the QBO Invoice", async () => {
   return `QBO PrivateNote "${q.PrivateNote ?? ""}"`;
 });
 
-console.log("- a timeout after a write: not inducible against the sandbox; covered by the fault-injection tests (sync/test/write-safety.test.ts)");
+console.log("- a timeout after a write: not inducible here; covered by the fault-injection tests (sync/test/write-safety.test.ts)");
 const failed = results.filter((r) => !r.ok).length;
-console.log(`\n${results.length - failed}/${results.length} scenarios verified against the QBO sandbox.`);
+console.log(`\n${results.length - failed}/${results.length} scenarios verified against ${deps.oauth ? "the QBO sandbox" : "the mock QBO"}.`);
 await deps.pool.end();
 process.exit(failed ? 1 : 0);

@@ -71,7 +71,8 @@ class Fault extends Error {
   }
 }
 
-export async function startFakeQbo(): Promise<FakeQbo> {
+/** Starts the fake on a random local port (tests), or on a given host and port (the mock-qbo service). */
+export async function startFakeQbo(listen: { host: string; port: number } = { host: "127.0.0.1", port: 0 }): Promise<FakeQbo> {
   const realmId = "9130000000000000";
   let nextId = 1;
   // Strictly increasing timestamps, so last-writer-wins is deterministic in tests.
@@ -403,7 +404,7 @@ export async function startFakeQbo(): Promise<FakeQbo> {
     return { Invoice: invoice, time: now() };
   });
 
-  await app.listen({ host: "127.0.0.1", port: 0 });
+  await app.listen(listen);
   const add = (entity: string, fields: object) => {
     const t = now();
     const row = { ...fields, Id: String(nextId++), SyncToken: "0", Active: true, MetaData: { CreateTime: t, LastUpdatedTime: t } };
@@ -412,7 +413,7 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   };
 
   return {
-    url: `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`,
+    url: `http://${listen.host === "0.0.0.0" ? "127.0.0.1" : listen.host}:${(app.server.address() as AddressInfo).port}`,
     realmId,
     customers: tables.Customer,
     items: tables.Item,

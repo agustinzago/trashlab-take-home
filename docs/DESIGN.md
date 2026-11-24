@@ -114,6 +114,7 @@ One-sided invoices are copied across only with `--create-missing`. That opt-in g
 - **Admin page** (`/admin`, HTTP Basic with `ADMIN_PASSWORD`, required at startup): open Conflicts and Link Candidates with Base and both values and buttons to pick a Side, Needs Attention items, failed jobs, and the Sync Attempt history per Link. A JSON API under `/admin/api` serves the same. Cross-site form posts are refused.
 - **QBO connection:** `/admin/qbo/connect` runs the OAuth 2 authorization-code flow; tokens live in the sync database and are refreshed under a row lock, both replaced in one statement.
 - **CLI** (`sync/src/cli.ts`): `backfill [--create-missing]`, `reconcile`, and `qbo-ids` (the Item and account ids Account Mapping needs).
+- **Mock QBO** (`mock-qbo/`): the in-memory fake the tests use, also run as a Compose service. With no Intuit app configured (`QBO_CLIENT_ID` empty) the sync uses it, so the stack runs out of the box; it sends signed webhooks like QBO.
 - **Scripts** (`sync/scripts/`): `spike.ts` checks the QBO behaviours this design assumes; `live-run.ts` drives the core scenarios against the sandbox.
 
 ## Tradeoffs and known limits

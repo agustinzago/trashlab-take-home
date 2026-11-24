@@ -10,7 +10,7 @@ import { buildSyncApp, type SyncDeps } from "../src/app.ts";
 import { createInternalClient } from "../src/internal.ts";
 import { createQboClient } from "../src/qbo.ts";
 import { drain, setAccountMapping } from "../src/worker.ts";
-import { startFakeQbo, type FakeQbo, type QboEvent } from "./fake-qbo.ts";
+import { startFakeQbo, type FakeQbo, type QboEvent } from "../../mock-qbo/fake-qbo.ts";
 
 export const webhookSecret = "internal-webhook-secret";
 export const qboWebhookVerifier = "qbo-verifier-token";
