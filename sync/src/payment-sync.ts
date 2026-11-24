@@ -240,7 +240,8 @@ async function invoiceOf(deps: SyncDeps, side: string, id: string): Promise<Link
     invoiceId = String(p.invoiceId);
   } else {
     const qp = await getQboPayment(deps, id);
-    if (!qp) return null;
+    // Gone, or voided before it was ever synced (a voided Payment has no lines left to say where it applied).
+    if (!qp || isQboVoided(qp)) return null;
     const applied = appliedTo(qp);
     if (applied.length !== 1) throw new NeedsAttention(appliedMessage(qp.Id, applied.length));
     invoiceId = applied[0];
@@ -262,7 +263,7 @@ export async function syncPayment(deps: SyncDeps, run: Run): Promise<void> {
     const known = await findLink<PaymentFields>(pool, "payment", side, id);
     // A linked Payment's Invoice comes from its Link: the record may be gone, or QBO may have cleared its LinkedTxn on void.
     const invoice = known?.parent_link_id ? await linkById(pool, known.parent_link_id) : await invoiceOf(deps, side, id);
-    if (!invoice) return run.record(pool, "skipped", `Payment ${id} no longer exists on the ${side} Side`);
+    if (!invoice) return run.record(pool, "skipped", `Payment ${id} no longer exists or was voided before it was synced; nothing to do`);
 
     await withInvoiceLock(pool, invoice.doc_number, async () => {
       const p = side === "internal" ? await deps.internal.getPayment(id) : null;

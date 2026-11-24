@@ -62,7 +62,13 @@ export function createQboClient(cfg: QboConfig) {
     },
     /** QBO's void keeps the record and zeroes it; it carries the SyncToken read, like an update. */
     async void(entity: string, body: { Id: string; SyncToken: string }, requestId?: string): Promise<any> {
-      return (await call("POST", withRequestId(`${entity.toLowerCase()}?operation=void`, requestId), body))[entity];
+      // An Invoice is voided with operation=void. A received Payment is voided as a sparse update with
+      // include=void: on a Payment, operation=void means voiding a card charge (confirmed in the sandbox spike).
+      const [path, payload] =
+        entity === "Payment"
+          ? ["payment?operation=update&include=void", { ...body, sparse: true }]
+          : [`${entity.toLowerCase()}?operation=void`, body];
+      return (await call("POST", withRequestId(path, requestId), payload))[entity];
     },
     /** Change data capture: everything of these entities changed since `changedSince`, deletes included. */
     async cdc(entities: string[], changedSince: string): Promise<{ entities: Record<string, any[]>; time: string }> {

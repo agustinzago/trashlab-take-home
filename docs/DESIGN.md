@@ -81,7 +81,7 @@ Each run writes exactly one **Sync Attempt** row. It records the outcome, a summ
 | Void or delete while the other side has payments applied | Needs Attention; payments are never auto-unlinked |
 | Void racing an edit | Void wins; the discarded edit is recorded in the attempt |
 
-QBO has no void flag. A voided Invoice or Payment shows `TotalAmt = 0` and a `PrivateNote` starting with "Voided", and that's what we detect (to be confirmed against the sandbox). Two guards keep a misread from voiding real receivables: a QBO "not found" counts as a hard delete only when a Delete notification (webhook or CDC) was received for it, and a QBO Invoice zeroed without a "Voided" note is Needs Attention rather than a merge of zeroed lines. A voided Invoice's Link is closed, so later hints are no-ops.
+QBO has no void flag. A voided Invoice or Payment shows `TotalAmt = 0` and a `PrivateNote` starting with "Voided", and that's what we detect (confirmed against the sandbox; see Sandbox findings). Two guards keep a misread from voiding real receivables: a QBO "not found" counts as a hard delete only when a Delete notification (webhook or CDC) was received for it, and a QBO Invoice zeroed without a "Voided" note is Needs Attention rather than a merge of zeroed lines. A voided Invoice's Link is closed, so later hints are no-ops.
 
 ## Payments
 
@@ -129,10 +129,18 @@ One-sided invoices are copied across only with `--create-missing`. That opt-in g
 
 ## Sandbox findings
 
-Pending: `sync/scripts/spike.ts` checks each behaviour below against the real sandbox, and its output belongs here. Until then the fake QBO models these assumptions:
+`sync/scripts/spike.ts` ran against the QBO sandbox on 2026-11-23 (company 9341458748388797). The fake QBO models what it found.
 
-- A void keeps the record with `TotalAmt` 0 and a `PrivateNote` starting with "Voided", for Invoices and Payments; a voided Payment drops out of its Invoice's `LinkedTxn`.
-- Repeating a write with the same `requestid` returns the original response for a short window; only successful writes are assumed replayed.
-- `DocNumber` is settable on create when Custom transaction numbers is on, and a duplicate is rejected (6140).
-- A Payment carries `PaymentRefNum` as sent, and the Invoice it pays lists it in `LinkedTxn` with a reduced `Balance`.
-- A stale `SyncToken` fails with Fault code 5010, and CDC reports a hard-deleted Invoice as `{status: "Deleted", Id}`.
+| Question | Observed | Effect |
+|---|---|---|
+| Custom transaction numbers | Off by default in a new sandbox company; must be turned on | The connect step and startup check enforce it |
+| DocNumber on create | Kept as sent | Shared identity holds |
+| DueDate omitted on create | QBO derives one from the default terms (Net 30) | Comes back as a QBO edit and is copied internally once |
+| Same `requestid` repeated | Returned the original Invoice, immediately and again after 65 s | Lost replies are covered for at least a minute; look-before-create covers longer gaps |
+| Duplicate DocNumber, no `requestid` | Rejected, Fault 6140 | A double create can't silently duplicate |
+| Payment `PaymentRefNum`, Invoice `LinkedTxn` | Ref kept as sent; the Invoice lists the Payment in `LinkedTxn` and its `Balance` drops; deposit defaults to Undeposited Funds | Payment links and look-before-create work as designed |
+| Voiding a Payment | `operation=void` is refused (Fault 6000, it voids card charges). `operation=update&include=void` works: `TotalAmt` 0, `PrivateNote` "Voided", `Line` emptied; the Payment leaves the Invoice's `LinkedTxn` and the balance is restored | **Assumption was wrong**: the client now voids Payments through update with include=void, and a voided Payment's Invoice comes from its Link, never from its (empty) lines |
+| Voiding an Invoice | `TotalAmt` 0, `Balance` 0, `PrivateNote` "Voided", line amounts 0 | Void detection holds |
+| Update with a stale `SyncToken` | Fault 5010 "Stale Object Error" | Classified as stale: refetch and re-merge |
+| CDC after a hard delete | `{domain: "QBO", status: "Deleted", Id, MetaData.LastUpdatedTime}` (with a UTC offset) | Delete hints match what the sync expects |
+| Refresh token reuse | This refresh returned the same refresh token, and the previous token was still honoured | A crash mid-refresh cannot leave the connection unusable |

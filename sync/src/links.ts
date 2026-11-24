@@ -103,5 +103,5 @@ export async function completeLink<B>(
   });
 }
 
-// QBO has no void flag: a voided Invoice or Payment is zeroed with a "Voided" note (to confirm in the sandbox spike, #2).
+// QBO has no void flag: a voided Invoice or Payment is zeroed with a "Voided" note (confirmed in the sandbox spike).
 export const isQboVoided = (q: any) => q.TotalAmt === 0 && String(q.PrivateNote ?? "").startsWith("Voided");

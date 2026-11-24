@@ -80,7 +80,7 @@ export function createTokenStore(pool: pg.Pool, oauth: OAuthConfig) {
         const locked = (await c.query("SELECT * FROM qbo_connection WHERE id = 1 FOR UPDATE")).rows[0];
         if (isFresh(locked)) return authOf(locked); // refreshed by someone else meanwhile
         // ponytail: if Intuit rotates the refresh token and we crash before COMMIT, we keep the previous one;
-        // Intuit is expected to honour it until the new one is used (confirm in the sandbox spike, #2).
+        // the sandbox spike saw the previous refresh token still honoured after a refresh.
         const t = await tokenRequest(oauth, { grant_type: "refresh_token", refresh_token: locked.refresh_token });
         await saveTokens(c, locked.realm_id, t);
         return { realmId: locked.realm_id, accessToken: t.access_token };

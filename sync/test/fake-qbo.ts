@@ -155,7 +155,7 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   let currentRefresh: string | null = null;
   const issuedCodes = new Set(["good-code"]);
 
-  /** QBO's void: the record stays, its amounts are zeroed and PrivateNote says "Voided" (to confirm in the spike). */
+  /** QBO's void: the record stays, its amounts are zeroed and PrivateNote says "Voided" (as the sandbox spike showed). */
   function voidInvoice(id: string, syncToken: string | null) {
     const idx = tables.Invoice.findIndex((i) => i.Id === id);
     if (idx < 0) throw new Fault("610", "Object Not Found");
@@ -248,7 +248,8 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   const voidPayment = (id: string, syncToken: string | null) =>
     changePayment(
       id,
-      (p) => ({ ...p, TotalAmt: 0, Line: p.Line.map((l: any) => ({ ...l, Amount: 0 })), PrivateNote: `Voided${p.PrivateNote ? ` ${p.PrivateNote}` : ""}` }),
+      // As the sandbox spike showed: zeroed, noted "Voided", and its lines (with their LinkedTxn) cleared.
+      (p) => ({ ...p, TotalAmt: 0, Line: [], PrivateNote: `Voided${p.PrivateNote ? ` ${p.PrivateNote}` : ""}` }),
       "Void",
       syncToken,
     );
@@ -381,7 +382,11 @@ export async function startFakeQbo(): Promise<FakeQbo> {
   app.post(`${base}/payment`, async (req) => {
     const body = req.body as any;
     const operation = (req.query as { operation?: string }).operation;
-    if (operation === "void") return { Payment: voidPayment(body.Id, body.SyncToken), time: now() };
+    // Real QBO voids a received Payment through update with include=void; operation=void is for card charges.
+    if (operation === "update" && (req.query as { include?: string }).include === "void") {
+      return { Payment: voidPayment(body.Id, body.SyncToken), time: now() };
+    }
+    if (operation === "void") throw new Fault("6000", "You can't void this credit card amount because this transaction doesn't have an outstanding credit card amount.");
     if (body.Id) throw new Fault("4000", "the fake does not model Payment updates by the sync");
     return { Payment: createPayment(body), time: now() };
   });

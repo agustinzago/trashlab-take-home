@@ -114,6 +114,19 @@ describe("Payments", () => {
     expect(qboInvoice("INV-5").Balance).toBe(100);
   });
 
+  it("skips a QBO Payment voided before it was ever synced (its lines are gone)", async () => {
+    const { inv, q } = await linked("INV-5B");
+    const qp = h.qbo.accountantPay({ customerId: q.CustomerRef.value, applied: { [q.Id]: 30 } });
+    h.qbo.accountantVoidPayment(qp.Id);
+    h.qbo.events.length = 0;
+
+    await h.sendQboWebhook([{ name: "Payment", id: qp.Id, operation: "Update", lastUpdated: "2031-01-01T00:00:00Z" }]);
+    await h.settle();
+
+    expect(await internalPayments(inv.id)).toEqual([]);
+    expect(await lastAttempt()).toMatchObject({ outcome: "skipped" });
+  });
+
   it("flags a Payment amount or date edit instead of syncing it", async () => {
     const { inv, q } = await linked("INV-6");
     const qp = h.qbo.accountantPay({ customerId: q.CustomerRef.value, applied: { [q.Id]: 30 } });
