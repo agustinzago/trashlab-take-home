@@ -4,6 +4,7 @@ Keeps receivable Invoices, and the Payments applied to them, in agreement betwee
 
 It is built against the real QBO Accounting API and verified on a QBO sandbox company: the spike script checked every QBO behaviour the design relies on, and the live run passed all 8 core scenarios there (see "Sandbox findings" in [docs/DESIGN.md](docs/DESIGN.md)). The bundled mock QBO exists only so the stack can be reviewed without an Intuit account; [Run against the QBO sandbox](#run-against-the-qbo-sandbox) switches to the real one.
 
+- **Live:** <https://trashlab.agustinzago.com>. The web console, hosted on Railway and connected to the QBO sandbox company; the sign-in password is shared separately. See [Hosted deployment](#hosted-deployment).
 - **Design:** [docs/DESIGN.md](docs/DESIGN.md). How it works, write safety, tradeoffs and known limits.
 - **Vocabulary:** [CONTEXT.md](CONTEXT.md). Change Hint, Link, Base, Conflict and the other terms used below.
 - **Decisions:** [docs/adr/](docs/adr/). The three-way merge, and syncing the ledger through Account Mapping.
@@ -168,6 +169,34 @@ sync/scripts/      spike.ts (checks the real QBO sandbox) and live-run.ts (core 
 sync/test/         integration tests against the fake QBO, plus the pure merge's unit tests
 mock-qbo/          the fake QBO: used by the tests, and run as the mock-qbo service
 web/               the web console: React + Vite, served by nginx, which also proxies both APIs
+```
+
+## Hosted deployment
+
+A running copy is at **<https://trashlab.agustinzago.com>**, connected to a QBO sandbox company. Sign in with the admin password (shared separately); everything in [Try it step by step](#try-it-step-by-step) works there against the real sandbox instead of the mock.
+
+It runs on [Railway](https://railway.com) from the same Dockerfiles as `docker compose`, one service each:
+
+| Service | Reachable at | Notes |
+|---|---|---|
+| `web` | <https://trashlab.agustinzago.com> | The only public service. nginx serves the console and proxies `/api/sync/*` and `/api/internal/*` on the same origin |
+| `sync` | `sync.railway.internal:3000` (private) | Worker, CDC poll and webhooks run always-on in this process |
+| `internal-system` | `internal-system.railway.internal:3001` (private) | Has no auth of its own: only reachable through the console, which checks the admin password on every call |
+| two Postgres | private | One database per system, as locally |
+
+- QBO OAuth redirect URI: `https://trashlab.agustinzago.com/api/sync/qbo/callback` (registered in the Intuit app's Development keys).
+- QBO webhook endpoint: `https://trashlab.agustinzago.com/api/sync/webhooks/qbo`. Without it, the 60-second CDC poll still picks up QBO changes.
+- The console's nginx config is a template (`web/default.conf.template`): its port, upstream addresses and DNS resolver come from the environment, with defaults that match `docker compose`. On Railway both Node services set `HOST=::` for the IPv6 private network.
+- Secrets (`ADMIN_PASSWORD`, `QBO_CLIENT_SECRET`, `QBO_WEBHOOK_VERIFIER`, the shared `INTERNAL_WEBHOOK_SECRET`) are Railway variables, never in the repository.
+- Why not serverless: the sync relies on an always-on worker loop, a per-minute CDC poll and Postgres advisory locks held across QBO calls, none of which fit request-scoped functions.
+
+Redeploy a service from a checkout linked to the project (`railway link`):
+
+```bash
+railway up -s sync -d
+```
+```bash
+railway up web --path-as-root -s web -d
 ```
 
 ## Run against the QBO sandbox
