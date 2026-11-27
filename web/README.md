@@ -11,7 +11,7 @@ A React app for the people who run the invoice sync: the Internal System's invoi
 
 ## How it talks to the backend
 
-The browser only ever talks to its own origin. nginx (production, `nginx.conf`) and Vite (development, `vite.config.ts`) proxy the same two paths:
+The browser only ever talks to its own origin. nginx (production, `default.conf.template`) and Vite (development, `vite.config.ts`) proxy the same two paths:
 
 | Path | Goes to |
 |---|---|
@@ -51,4 +51,4 @@ npm run build
 
 ## Design
 
-Visual language: a warm paper ground, near-black ink, sky and periwinkle accents, Inter Tight display type, IBM Plex Mono eyebrows and labels. Fonts are self-hosted (`@fontsource`), so the strict Content-Security-Policy in `nginx.conf` holds.
+Visual language: a warm paper ground, near-black ink, sky and periwinkle accents, Inter Tight display type, IBM Plex Mono eyebrows and labels. Fonts are self-hosted (`@fontsource`), so the strict Content-Security-Policy in `default.conf.template` holds.

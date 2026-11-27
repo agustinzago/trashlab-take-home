@@ -1,0 +1,5 @@
+#!/bin/sh
+# The container's DNS server for nginx's `resolver`; an IPv6 one needs brackets.
+ns=$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf)
+case "$ns" in *:*) ns="[$ns]" ;; esac
+export NGINX_RESOLVER="${NGINX_RESOLVER:-$ns}"

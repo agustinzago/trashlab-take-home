@@ -20,7 +20,7 @@ if (await deps.tokens.isConnected()) {
   console.log("QBO is not connected yet: connect it from the web console or /admin/qbo/connect. Sync work is held until then.");
 }
 const app = buildSyncApp(deps);
-await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 3000) });
+await app.listen({ host: process.env.HOST ?? "0.0.0.0", port: Number(process.env.PORT ?? 3000) });
 const stopWorker = startWorker(deps);
 const stopCdc = startCdcPoller(deps);
 console.log("sync service listening");

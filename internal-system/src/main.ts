@@ -13,7 +13,7 @@ const pool = new pg.Pool({ connectionString: required("DATABASE_URL") });
 await migrate(pool, new URL("./schema.sql", import.meta.url));
 
 const app = buildApp(pool);
-await app.listen({ host: "0.0.0.0", port: Number(process.env.PORT ?? 3001) });
+await app.listen({ host: process.env.HOST ?? "0.0.0.0", port: Number(process.env.PORT ?? 3001) });
 
 const chaos = process.env.CHAOS === "1" || process.env.CHAOS === "true";
 const stopDelivery = startDelivery(pool, { url: required("WEBHOOK_URL"), secret: required("WEBHOOK_SECRET"), chaos });

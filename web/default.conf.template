@@ -1,6 +1,7 @@
 # Serves the built console and proxies both APIs on the same origin (no CORS).
+# A template: the nginx image fills ${VARS} from the environment at start (defaults in the Dockerfile).
 server {
-  listen 8080;
+  listen ${PORT};
   server_tokens off;
   root /usr/share/nginx/html;
 
@@ -17,11 +18,12 @@ server {
   # A 401 goes to the console's sign-in screen, not the browser's native prompt.
   proxy_hide_header WWW-Authenticate;
 
-  # Resolve upstreams per request through Docker's DNS: a recreated sync or internal-system
-  # container gets a new IP, and a name fixed at startup would keep pointing at the old one (502).
-  resolver 127.0.0.11 valid=10s ipv6=off;
-  set $sync http://sync:3000;
-  set $internal http://internal-system:3001;
+  # Resolve upstreams per request: a recreated sync or internal-system container gets a new IP,
+  # and a name fixed at startup would keep pointing at the old one (502). The resolver is the
+  # container's own (Docker's, or Railway's private DNS), read from /etc/resolv.conf at start.
+  resolver ${NGINX_RESOLVER} valid=10s;
+  set $sync ${SYNC_UPSTREAM};
+  set $internal ${INTERNAL_UPSTREAM};
 
   location /api/sync/ {
     rewrite ^/api/sync/(.*)$ /$1 break;
